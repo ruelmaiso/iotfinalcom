@@ -1,0 +1,32 @@
+venv/
+__pycache__/
+*.pyc
+
+logs/
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+
+# VSCode settings
+.vscode/
+
+# Logs
+*.log
+
+# Database files (optional kung ayaw mo isama)
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db
