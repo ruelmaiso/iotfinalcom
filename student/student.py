@@ -1,5 +1,6 @@
 import json
 import queue
+import random
 import socket
 import threading
 import time
@@ -90,44 +91,18 @@ class OverlayController:
     def _build_lock_frame(self) -> ctk.CTkFrame:
         assert self._root is not None
 
-        screen_w = self._root.winfo_screenwidth()
-        screen_h = self._root.winfo_screenheight()
-
         frame = ctk.CTkFrame(self._root, fg_color="#0F172A")
         frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        bg_path = resource_path("assets/essu_background.jpg")
-
-        try:
-            img = Image.open(bg_path)
-
-            src_w, src_h = img.size
-
-            # FIT WITHOUT CROPPING
-            scale = min(screen_w / src_w, screen_h / src_h)
-
-            new_w = int(src_w * scale)
-            new_h = int(src_h * scale)
-
-            resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-            bg_image = ctk.CTkImage(
-                light_image=resized,
-                dark_image=resized,
-                size=(new_w, new_h),
-            )
-
-            bg_label = ctk.CTkLabel(frame, text="", image=bg_image)
-            bg_label.place(relx=0.5, rely=0.5, anchor="center")
-            bg_label.image = bg_image
-
-        except Exception:
-            pass
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        card_w = min(600, int(screen_w * 0.8))
+        card_h = min(240, int(screen_h * 0.6))
 
         lock_card = ctk.CTkFrame(
             frame,
-            width=560,
-            height=240,
+            width=card_w,
+            height=card_h,
             fg_color="#1E293B",
             corner_radius=18,
             border_width=1,
@@ -137,14 +112,14 @@ class OverlayController:
 
         ctk.CTkLabel(
             lock_card,
-            text="?? Session Locked",
+            text="Session Paused",
             font=("Arial", 28, "bold"),
             text_color="#F8FAFC",
         ).pack(pady=(42, 12))
 
         ctk.CTkLabel(
             lock_card,
-            text="This workstation is controlled by the instructor.",
+            text="This workstation is Temporary Paused.",
             font=("Arial", 14),
             text_color="#94A3B8",
         ).pack(pady=(0, 24))
@@ -313,6 +288,11 @@ class OverlayController:
                 if resp.get("ok") and isinstance(resp.get("user"), dict):
                     self._auth_result_q.put(resp.get("user"))
                     return
+                if resp.get("reason") == "reserved_for_another_student":
+                    msg = str(resp.get("message") or "This workstation is reserved for another student during this time.")
+                    status_login.configure(text=msg, text_color="#EF4444")
+                    self.notify_message_async(msg)
+                    return
                 status_login.configure(text="Invalid credentials. Please try again.", text_color="#EF4444")
 
             login_btn = ctk.CTkButton(card, text="Login", command=on_login, width=420)
@@ -370,10 +350,11 @@ class OverlayController:
     def _position_chat_launcher(self) -> None:
         if self._chat_launcher is None or not self._chat_launcher.winfo_exists():
             return
-        width = 100
-        height = 40
-        top_margin = 10
         screen_w = int(self._chat_launcher.winfo_screenwidth())
+        screen_h = int(self._chat_launcher.winfo_screenheight())
+        width = max(100, min(180, int(screen_w * 0.10)))
+        height = 40
+        top_margin = max(10, int(screen_h * 0.02))
         x = max(0, (screen_w - width) // 2)
         self._chat_launcher.geometry(f"{width}x{height}+{x}+{top_margin}")
 
@@ -659,8 +640,6 @@ class OverlayController:
 
     def _ui_loop(self) -> None:
         self._root = ctk.CTk()
-
-        # NEW: signal root is created and ready for commands
         self._ui_ready_event.set()
 
         self._root.title("Student Overlay")
@@ -1411,11 +1390,13 @@ class StudentDeployClient:
                 self._update_state(connected=is_connected, connecting=False)
                 if not is_connected:
                     self._cleanup_sockets()
-                    time.sleep(self.dynamic_reconnect_interval_s)
+                    sleep_time = self.dynamic_reconnect_interval_s + random.uniform(0, 0.4)
+                    time.sleep(sleep_time)
             except Exception:
                 self._update_state(connecting=False, connected=False)
                 self._cleanup_sockets()
-                time.sleep(self.dynamic_reconnect_interval_s)
+                sleep_time = self.dynamic_reconnect_interval_s + random.uniform(0, 0.4)
+                time.sleep(sleep_time)
 
     def _resource_snapshot(self) -> dict:
         try:
@@ -1623,9 +1604,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 

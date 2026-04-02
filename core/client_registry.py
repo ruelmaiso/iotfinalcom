@@ -42,3 +42,11 @@ class ClientRegistry:
         self._data["clients"].append({"mac": normalized_mac, "hostname": hostname, "pc_id": pc_id})
         self._save(self._data)
         return pc_id
+
+    def list_pc_ids(self) -> list[str]:
+        pc_ids = []
+        for client in self._data.get("clients", []):
+            pc_id = str(client.get("pc_id", "")).strip()
+            if pc_id:
+                pc_ids.append(pc_id)
+        return sorted(set(pc_ids))

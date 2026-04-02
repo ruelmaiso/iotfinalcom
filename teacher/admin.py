@@ -29,6 +29,9 @@ from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
 from core.protocol import recv_frame, recv_json_line, send_json
 from core.app_settings import AppSettings, SettingsStore
+from teacher.reservations import ReservationManager
+from teacher.ui.student_management import StudentManagementPanel
+from teacher.ui.reservation_management import ReservationManagementPanel
 from teacher.theme import (
     STATUS_COLORS as THEME_STATUS_COLORS,
     ESSU_PRIMARY,
@@ -52,6 +55,7 @@ class ClientState:
     mac: str
     hostname: str
     control_sock: Optional[socket.socket] = None
+    control_send_lock: threading.Lock = field(default_factory=threading.Lock)
     video_sock: Optional[socket.socket] = None
     last_frame: Optional[Image.Image] = None
     heartbeat: HeartbeatState = field(default_factory=HeartbeatState)
@@ -174,6 +178,7 @@ class TeacherDeployServer:
     def __init__(self) -> None:
         self.registry = ClientRegistry(ROOT / "client_registry.json")
         self.auth_db = AuthDatabase(ROOT / "data" / "lab_monitor.db")
+        self.reservation_manager = ReservationManager(self.auth_db)
         self.clients: dict[str, ClientState] = {}
         self.sensors: dict[str, SensorState] = {}
         self.timers: dict[str, TimerState] = {}
@@ -201,8 +206,19 @@ class TeacherDeployServer:
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self.timers_file = ROOT / "data" / "active_timers.json"
+        self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
         self._load_active_sessions_from_db()
+        persisted_session_timers = self._load_session_timers()
+        if persisted_session_timers:
+            for pc_id, payload in persisted_session_timers.items():
+                if pc_id in self.active_sessions_by_pc_id:
+                    timer = self._session_timer_from_payload(pc_id, payload)
+                    if timer:
+                        self.active_sessions_by_pc_id[pc_id]["session_timer"] = payload
+                        client_ref = self.clients.get(pc_id)
+                        if client_ref:
+                            client_ref.session_timer = timer
         self._load_persisted_timers()
 
     def _load_active_sessions_from_db(self) -> None:
@@ -271,6 +287,39 @@ class TeacherDeployServer:
             return timer
         except Exception:
             return None
+
+    def _persist_session_timers(self) -> None:
+        try:
+            with self.lock:
+                payload: dict[str, dict] = {}
+                for pc_id, entry in self.active_sessions_by_pc_id.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    client_ref = self.clients.get(pc_id)
+                    timer_state = client_ref.session_timer if client_ref else None
+                    if timer_state:
+                        timer_payload = self._session_timer_payload(timer_state)
+                    else:
+                        timer_payload = entry.get("session_timer") if isinstance(entry.get("session_timer"), dict) else None
+                    if timer_payload:
+                        payload[pc_id] = timer_payload
+            temp_path = self.session_timers_file.with_suffix(".json.tmp")
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            temp_path.replace(self.session_timers_file)
+        except Exception:
+            pass
+
+    def _load_session_timers(self) -> dict[str, dict]:
+        if not self.session_timers_file.exists():
+            return {}
+        try:
+            data = json.loads(self.session_timers_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            return {}
 
     def _persist_timers(self) -> None:
         self.timers_file.parent.mkdir(parents=True, exist_ok=True)
@@ -588,7 +637,7 @@ class TeacherDeployServer:
                             state.interrupted_until_ts = None
                             state.interrupted_student_number = ""
                     pc_id = assigned
-                    send_json(client_sock, {
+                    self._send_control_json(assigned, client_sock, {
                         "type": "register_ack",
                         "pc_id": assigned,
                         "server_ts": time.time(),
@@ -694,28 +743,48 @@ class TeacherDeployServer:
             return False
         return parts[0].isdigit() and len(parts[0]) == 2 and parts[1].isdigit() and len(parts[1]) == 5
 
+    def _send_control_json(self, pc_id: str, client_sock: socket.socket, payload: dict) -> bool:
+        with self.lock:
+            client = self.clients.get(pc_id)
+            if not client or client.control_sock is not client_sock:
+                return False
+            send_lock = client.control_send_lock
+        with send_lock:
+            send_json(client_sock, payload)
+        return True
+
     def _handle_student_register(self, msg: dict, client_sock: socket.socket, pc_id: str) -> None:
         full_name = str(msg.get("full_name", "")).strip()
         year_section = str(msg.get("year_section", "")).strip()
         student_number = str(msg.get("student_number", "")).strip()
         password = str(msg.get("password", ""))
         if not full_name or not year_section or not password or not self._valid_student_number(student_number):
-            send_json(client_sock, {"type": "auth_ack", "action": "register", "ok": False, "reason": "invalid_registration_fields"})
+            self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "register", "ok": False, "reason": "invalid_registration_fields"})
             return
         ok, reason = self.auth_db.register_student(full_name, year_section, student_number, password)
-        send_json(client_sock, {"type": "auth_ack", "action": "register", "ok": ok, "reason": reason})
+        self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "register", "ok": ok, "reason": reason})
 
     def _handle_student_login(self, msg: dict, client_sock: socket.socket, pc_id: str) -> None:
         student_number = str(msg.get("student_number", "")).strip()
         password = str(msg.get("password", ""))
         user = self.auth_db.verify_login(student_number, password)
         if not user:
-            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "invalid_credentials"})
+            self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "invalid_credentials"})
+            return
+        active_reservation = self.reservation_manager.get_active_reservation(pc_id, time.time())
+        if active_reservation and str(active_reservation.get("student_number", "")).strip() != student_number:
+            self._send_control_json(pc_id, client_sock, {
+                "type": "auth_ack",
+                "action": "login",
+                "ok": False,
+                "reason": "reserved_for_another_student",
+                "message": "This workstation is reserved for another student during this time.",
+            })
             return
         used_today_s = self.auth_db.get_today_usage_seconds(student_number)
         remaining_today_s = max(0, int(self.settings.daily_limit_s) - used_today_s)
         if remaining_today_s <= 0:
-            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "daily_limit_reached"})
+            self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "daily_limit_reached"})
             return
         session_limit_s = min(int(self.settings.session_duration_s), remaining_today_s)
         session_duration_ms = int(session_limit_s) * 1000
@@ -725,7 +794,7 @@ class TeacherDeployServer:
                 session_id = self.auth_db.open_session(pc_id, user)
                 client = self.clients[pc_id]
                 existing_timer = client.session_timer
-                if existing_timer is not None:
+                if existing_timer is not None and client.student_number == user["student_number"]:
                     existing_remaining_ms = self._timer_remaining_ms(existing_timer, server_ts)
                     if existing_remaining_ms > 0:
                         session_duration_ms = min(session_duration_ms, int(existing_remaining_ms))
@@ -743,7 +812,7 @@ class TeacherDeployServer:
             else:
                 send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
                 return
-        send_json(client_sock, {
+        self._send_control_json(pc_id, client_sock, {
             "type": "auth_ack",
             "action": "login",
             "ok": True,
@@ -765,6 +834,7 @@ class TeacherDeployServer:
             "session_timer": session_timer_payload,
         }
         self._put_bounded(self.status_queue, pc_id)
+        self._persist_session_timers()
 
     def _handle_session_resume(self, msg: dict, client_sock: socket.socket, pc_id: str) -> None:
         user = msg.get("user", {}) if isinstance(msg.get("user"), dict) else {}
@@ -772,7 +842,17 @@ class TeacherDeployServer:
         year_section = str(user.get("year_section", "")).strip()
         student_number = str(user.get("student_number", "")).strip()
         if not full_name or not year_section or not self._valid_student_number(student_number):
-            send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "invalid_resume_payload"})
+            self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "invalid_resume_payload"})
+            return
+        active_reservation = self.reservation_manager.get_active_reservation(pc_id, time.time())
+        if active_reservation and str(active_reservation.get("student_number", "")).strip() != student_number:
+            self._send_control_json(pc_id, client_sock, {
+                "type": "auth_ack",
+                "action": "resume",
+                "ok": False,
+                "reason": "reserved_for_another_student",
+                "message": "This workstation is reserved for another student during this time.",
+            })
             return
         with self.lock:
             client = self.clients.get(pc_id)
@@ -797,17 +877,20 @@ class TeacherDeployServer:
                     client.interrupted_until_ts = None
                     client.interrupted_student_number = ""
                 else:
-                    send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "no_resumable_session"})
+                    with client.control_send_lock:
+                        send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "no_resumable_session"})
                     return
             if client.interrupted and client.interrupted_student_number and client.interrupted_student_number != student_number:
-                send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "resume_mismatch"})
+                with client.control_send_lock:
+                    send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "resume_mismatch"})
                 return
             if (
                 client.current_user != full_name
                 or client.year_section != year_section
                 or client.student_number != student_number
             ):
-                send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "resume_mismatch"})
+                with client.control_send_lock:
+                    send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": False, "reason": "resume_mismatch"})
                 return
             session_timer = client.session_timer
             if (
@@ -824,8 +907,10 @@ class TeacherDeployServer:
                     "login_ts": float(session_timer.start_ts),
                     "session_timer": self._session_timer_payload(session_timer),
                 }
-                send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": True, "server_ts": time.time()})
+                with client.control_send_lock:
+                    send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": True, "server_ts": time.time()})
                 self._put_bounded(self.status_queue, pc_id)
+                self._persist_session_timers()
                 return
             session_id = self.auth_db.open_session(pc_id, {
                 "full_name": client.current_user,
@@ -859,9 +944,10 @@ class TeacherDeployServer:
             "login_ts": float(client.session_timer.start_ts) if client.session_timer else time.time(),
             "session_timer": self._session_timer_payload(client.session_timer),
         }
-        send_json(client_sock, {"type": "auth_ack", "action": "resume", "ok": True, "server_ts": time.time()})
+        self._send_control_json(pc_id, client_sock, {"type": "auth_ack", "action": "resume", "ok": True, "server_ts": time.time()})
         self._start_recording_for_session(pc_id, session_id)
         self._put_bounded(self.status_queue, pc_id)
+        self._persist_session_timers()
 
     def _timer_remaining_ms(self, timer: TimerState, now: Optional[float] = None) -> int:
         ts_now = time.time() if now is None else float(now)
@@ -1432,6 +1518,8 @@ class TeacherDeployServer:
                     self._clear_conversation_for_pc(pc_id)
                 self._stop_recording(pc_id, status="disconnected")
                 self._put_bounded(self.status_queue, pc_id)
+            if expired or interrupted_expired:
+                self._persist_session_timers()
             if now >= next_retention_prune_ts:
                 with self.lock:
                     self._prune_conversation_retention(now)
@@ -1539,6 +1627,7 @@ class TeacherDeployServer:
             if not client:
                 return None
             control_sock = client.control_sock
+            control_send_lock = client.control_send_lock
             peer_ip = client.peer_ip
             control_generation = client.control_generation
         cmd_id = f"cmd-{uuid.uuid4().hex[:12]}"
@@ -1547,7 +1636,8 @@ class TeacherDeployServer:
             msg.update(payload)
         if control_sock:
             try:
-                send_json(control_sock, msg)
+                with control_send_lock:
+                    send_json(control_sock, msg)
                 with self.lock:
                     current = self.clients.get(pc_id)
                     if not current or current.control_generation != control_generation or current.control_sock is not control_sock:
@@ -1623,6 +1713,7 @@ class TeacherDeployServer:
                 if should_stop:
                     self._stop_recording(pc_id, status="admin_signout")
                 self._put_bounded(self.status_queue, pc_id)
+        self._persist_session_timers()
 
     def unlock_targets(self, targets: list[str]) -> None:
         if bool(self.settings.enable_timer_pause_on_temp_lock):
@@ -1692,12 +1783,15 @@ class TeacherDeployServer:
                 client = self.clients.get(pc_id)
                 if client and client.current_user and client.session_timer:
                     client.session_timer.duration_ms = max(0, int(client.session_timer.duration_ms + extra_ms))
+                    if pc_id in self.active_sessions_by_pc_id:
+                        self.active_sessions_by_pc_id[pc_id]["session_timer"] = self._session_timer_payload(client.session_timer)
         affected_pc_ids = {pc_id for _, pc_id in affected_pairs}
         for pc_id in targets:
             if pc_id in affected_pc_ids:
                 continue
             self.send_command(pc_id, "EXTEND_TIMER", {"timer_id": "session", "extra_ms": int(extra_ms)})
         self._persist_timers()
+        self._persist_session_timers()
 
     def cancel_timer(self, targets: list[str]) -> None:
         target_set = set(targets)
@@ -1791,6 +1885,20 @@ class TeacherDeployUI:
         self._drain_rr_index: int = 0
         self.chat_sidebar_window: Optional[ctk.CTkToplevel] = None
         self.chat_sidebar_body: Optional[ctk.CTkScrollableFrame] = None
+        self.student_management_panel = StudentManagementPanel(
+            parent=self.root,
+            auth_db=self.server.auth_db,
+            theme_palette_provider=self._theme_palette,
+            font_family=self.FONT_FAMILY,
+        )
+        self.reservation_management_panel = ReservationManagementPanel(
+            parent=self.root,
+            reservation_manager=self.server.reservation_manager,
+            auth_db=self.server.auth_db,
+            pc_ids_provider=self.server.registry.list_pc_ids,
+            theme_palette_provider=self._theme_palette,
+            font_family=self.FONT_FAMILY,
+        )
 
         # =========================
         # 1) TOP BAR (Fixed Height = 160) — SENSOR PANEL
@@ -1809,8 +1917,24 @@ class TeacherDeployUI:
             text_color=TEXT_PRIMARY
         )
         self.top_title_label.pack(side="left")
-        self.settings_button = ctk.CTkButton(title_row, text="⚙ Settings", command=self._open_settings_modal, width=110, **BUTTON_NEUTRAL)
+        self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, **BUTTON_NEUTRAL)
         self.settings_button.pack(side="right", padx=(8, 0))
+        self.reservations_button = ctk.CTkButton(
+            title_row,
+            text="Reservations",
+            command=self._open_reservation_management,
+            width=120,
+            **BUTTON_NEUTRAL,
+        )
+        self.reservations_button.pack(side="right", padx=(8, 0))
+        self.students_button = ctk.CTkButton(
+            title_row,
+            text="Students",
+            command=self._open_student_management,
+            width=100,
+            **BUTTON_NEUTRAL,
+        )
+        self.students_button.pack(side="right", padx=(8, 0))
         self.selected_history_button = ctk.CTkButton(
             title_row,
             text="Selected PC History",
@@ -1839,12 +1963,11 @@ class TeacherDeployUI:
             ("student_number", "Student No.", "--"),
             ("session_left", "Session Left", "--"),
             ("status", "Status", "--"),
-            ("timer", "Timer Remaining", "--"),
             ("timer_extended", "Extended Timer", "00:00"),
             ("sensor_age", "Last sensor update", "--"),
             ("system", "System Online", "--"),
         ]
-        group_breaks = {"uptime", "session_left", "timer"}
+        group_breaks = {"uptime", "session_left"}
         for key, title, initial in sensor_fields:
             block = ctk.CTkFrame(sensor_row, fg_color="transparent")
             block.pack(side="left", padx=22)
@@ -1914,7 +2037,7 @@ class TeacherDeployUI:
         self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=92, **BUTTON_NEUTRAL)
         self.cancel_timer_btn.pack(side="left", padx=4)
 
-        self.chat_btn = ctk.CTkButton(timer_group, text="?? Chat", command=self._open_chat_sidebar, width=120, **BUTTON_NEUTRAL)
+        self.chat_btn = ctk.CTkButton(timer_group, text="Chat", command=self._open_chat_sidebar, width=120, **BUTTON_NEUTRAL)
         self.chat_btn.pack(side="left", padx=(6, 4))
 
         # self.approve_ext_btn = ctk.CTkButton(self.left_controls_frame, text="Approve Extension", command=self._approve_extension_selected, width=140, **BUTTON_WARNING)
@@ -3044,8 +3167,16 @@ class TeacherDeployUI:
             win.destroy()
 
         ctk.CTkButton(actions, text="Overall Session History", command=self._open_overall_history, **BUTTON_NEUTRAL).pack(side="left", padx=4)
+        # ctk.CTkButton(actions, text="Students", command=self._open_student_management, **BUTTON_NEUTRAL).pack(side="left", padx=4)
+        # ctk.CTkButton(actions, text="Reservations", command=self._open_reservation_management, **BUTTON_NEUTRAL).pack(side="left", padx=4)
         ctk.CTkButton(actions, text="Close", command=win.destroy, **BUTTON_NEUTRAL).pack(side="right", padx=4)
         ctk.CTkButton(actions, text="Save", command=save_settings, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+
+    def _open_student_management(self) -> None:
+        self.student_management_panel.open()
+
+    def _open_reservation_management(self) -> None:
+        self.reservation_management_panel.open()
 
     def _update_sensor_panel(self, pc_id: str) -> None:
         sensor = self.server.sensors.get(pc_id, SensorState())
@@ -3130,7 +3261,6 @@ class TeacherDeployUI:
         self.sensor_value_labels["student_number"].configure(text=student_number, text_color=neutral)
         self.sensor_value_labels["session_left"].configure(text=session_left, text_color=session_left_color)
         self.sensor_value_labels["status"].configure(text=self._display_status(status), text_color=color)
-        self.sensor_value_labels["timer"].configure(text=timer_remaining, text_color=neutral)
         self.sensor_value_labels["timer_extended"].configure(text=timer_extended, text_color=neutral)
         self.sensor_value_labels["sensor_age"].configure(text=sensor_age, text_color=sensor_age_color)
         self.sensor_value_labels["system"].configure(text=system_line.replace("System Online: ", ""), text_color=neutral)
@@ -3289,13 +3419,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
 
 
 
