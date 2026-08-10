@@ -34,3 +34,20 @@ student pyinstaller command
 
 
 pyinstaller --noconfirm --clean --onefile --windowed --paths . --hidden-import config.deploy_settings --name ESSU-SLMS-StudentAgent --icon assets/app_icon.ico --add-data "assets;assets" student/student.py
+
+
+1. Arteche E-pasabuy: An online request and Delivery System for Arteche, Eastern Samar.
+2. Design and Implementation Of an Iot-Based Flood Monitoring  And Early Warning System With Mobile Application Integration For Baranggay Of Arteche Eastern Samar.
+3. Community Resource Mapping System For Vulnerable Groups: Web and Mobile Platform For San Policarpo Eastern Samar.
+4. Web and Mobile Based Land Tax Management System For Municipal TReasurer's office of Arteche Eastern Samar.
+5. Design and Development Of a Web and Mobile Community Intelligence for Predictive Poverty Mapping and Citizen-Centric Services in Arteche Eastern Samar.
+6. PAGTIPIG: Mangrove Monitoring System.
+7. Design and Implementation of an Iot-Based Hybrid wind-solar powered streetkights with energy monitoring system for Baranggay 04 San policarpo.
+8. Web based Centralized Transaction Information System for the MSWD office of Arteche, Eastern samar.
+9. Web-Based Device Fisheries Tracker for Catch Logging Visualization and Sustainable Harvest Planning in Arteche.
+10 Web and mobile based Embie Transportation system with real-time location tracking and online payment.
+11. Iot-Based Smart Laboratory Management System for Essu Arteche campus.
+12. WEb based Academic Record and Grading Management System with Mobile Application for the Senior high Department of Arteche National high school.
+13. E-Ayuda: A web and Mobile Relief Distribution system with biometric and code verification for high risk in arteche eastern samar.
+14. RFID and biometrics-Based Entrance and Exit System for arteche National High School.
+15. Safety Routes: An Android-Based Offline and online Hazard Mapping and Smart Routing System

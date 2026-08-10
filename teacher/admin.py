@@ -5,6 +5,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 import uuid
 import tkinter as tk
 from tkinter import messagebox
@@ -16,7 +17,12 @@ from typing import Optional
 
 import cv2
 import customtkinter as ctk
+import mss
 import numpy
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +33,7 @@ from config.deploy_settings import NETWORK, RUNTIME
 from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
-from core.protocol import recv_frame, recv_json_line, send_json
+from core.protocol import recv_frame, recv_json_line, send_frame, send_json
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
 from teacher.ui.student_management import StudentManagementPanel
@@ -48,6 +54,12 @@ from teacher.theme import (
     DARK_TEXT_SECONDARY,
 )
 
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_DTYPE = "int16"
+AUDIO_BLOCK_MS = 40
+AUDIO_BLOCK_SIZE = max(1, int(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_MS / 1000))
+
 
 @dataclass
 class ClientState:
@@ -57,6 +69,8 @@ class ClientState:
     control_sock: Optional[socket.socket] = None
     control_send_lock: threading.Lock = field(default_factory=threading.Lock)
     video_sock: Optional[socket.socket] = None
+    broadcast_sock: Optional[socket.socket] = None
+    broadcast_audio_sock: Optional[socket.socket] = None
     last_frame: Optional[Image.Image] = None
     heartbeat: HeartbeatState = field(default_factory=HeartbeatState)
     online: bool = False
@@ -79,6 +93,8 @@ class ClientState:
     interrupted_student_number: str = ""
     control_generation: int = 0
     video_generation: int = 0
+    broadcast_generation: int = 0
+    broadcast_audio_generation: int = 0
     heartbeat_generation: int = 0
     lock_intent: bool = False
     lock_reason: Optional[str] = None
@@ -160,7 +176,7 @@ STATUS_COLORS = THEME_STATUS_COLORS
 CONVERSATION_TTL_S = 6 * 60 * 60
 CONVERSATION_MAX_PCS = 500
 
-VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER"}
+VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "BROADCAST_START", "BROADCAST_STOP", "SHUTDOWN", "RESTART"}
 ERROR_CODES = {
     "CONTROL_VALIDATION_ERROR",
     "SENSOR_VALIDATION_ERROR",
@@ -172,6 +188,13 @@ LOG_DIR = ROOT / "logs"
 LOG_FILE = LOG_DIR / "teacher_runtime.log"
 HEALTH_FILE = LOG_DIR / "health_latest.json"
 HEALTH_HISTORY_LIMIT = 720
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(path)
 
 
 class TeacherDeployServer:
@@ -205,6 +228,11 @@ class TeacherDeployServer:
         self.video_status_last_ts_by_pc: dict[str, float] = {}
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
+        self.broadcast_target_ids: set[str] = set()
+        self.broadcast_thread: Optional[threading.Thread] = None
+        self.broadcast_stop_event = threading.Event()
+        self.broadcast_audio_thread: Optional[threading.Thread] = None
+        self.broadcast_audio_stop_event = threading.Event()
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -307,8 +335,8 @@ class TeacherDeployServer:
             temp_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             temp_path.replace(self.session_timers_file)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_event("session_timers_persist_error", reason=str(exc))
 
     def _load_session_timers(self) -> dict[str, dict]:
         if not self.session_timers_file.exists():
@@ -322,7 +350,6 @@ class TeacherDeployServer:
             return {}
 
     def _persist_timers(self) -> None:
-        self.timers_file.parent.mkdir(parents=True, exist_ok=True)
         payload = []
         with self.lock:
             timers = list(self.timers.values())
@@ -338,7 +365,10 @@ class TeacherDeployServer:
                 "paused_at_ts": timer.paused_at_ts,
                 "paused_accum_ms": int(timer.paused_accum_ms),
             })
-        self.timers_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        try:
+            _write_json_atomic(self.timers_file, payload)
+        except Exception as exc:
+            self._log_event("timers_persist_error", reason=str(exc))
 
     def _load_persisted_timers(self) -> None:
         if not self.timers_file.exists():
@@ -402,6 +432,14 @@ class TeacherDeployServer:
         payload = {"ts": round(time.time(), 3), "event": event, **data}
         self.logger.info(json.dumps(payload, sort_keys=True))
 
+    def _run_guarded_loop(self, loop_name: str, target, restart_delay_s: float = 1.0) -> None:
+        while True:
+            try:
+                target()
+            except Exception as exc:
+                self._log_event("background_loop_restart", loop=loop_name, reason=str(exc))
+                time.sleep(max(0.2, float(restart_delay_s)))
+
     def _aggregate_health(self) -> HealthSnapshot:
         with self.lock:
             total_clients = len(self.clients)
@@ -427,7 +465,6 @@ class TeacherDeployServer:
         )
 
     def _write_health_snapshot(self, snapshot: HealthSnapshot) -> None:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": round(snapshot.ts, 3),
             "total_clients": snapshot.total_clients,
@@ -440,7 +477,10 @@ class TeacherDeployServer:
             "invalid_messages": snapshot.invalid_messages,
             "dropped_frames": snapshot.dropped_frames,
         }
-        HEALTH_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        try:
+            _write_json_atomic(HEALTH_FILE, payload)
+        except Exception as exc:
+            self._log_event("health_snapshot_write_error", reason=str(exc))
 
     def _metrics_for(self, pc_id: str) -> ClientMetrics:
         if pc_id not in self.metrics:
@@ -547,10 +587,10 @@ class TeacherDeployServer:
         threading.Thread(target=self._run_video_server, daemon=True).start()
         threading.Thread(target=self._run_sensor_server, daemon=True).start()
         threading.Thread(target=self._run_udp_fallback_server, daemon=True).start()
-        threading.Thread(target=self._monitor_heartbeats, daemon=True).start()
-        threading.Thread(target=self._run_reconciliation_loop, daemon=True).start()
-        threading.Thread(target=self._run_observability_loop, daemon=True).start()
-        threading.Thread(target=self._monitor_student_sessions, daemon=True).start()
+        threading.Thread(target=self._run_guarded_loop, args=("heartbeat_monitor", self._monitor_heartbeats), daemon=True).start()
+        threading.Thread(target=self._run_guarded_loop, args=("reconciliation", self._run_reconciliation_loop), daemon=True).start()
+        threading.Thread(target=self._run_guarded_loop, args=("observability", self._run_observability_loop), daemon=True).start()
+        threading.Thread(target=self._run_guarded_loop, args=("student_sessions", self._monitor_student_sessions), daemon=True).start()
 
     def _run_control_server(self) -> None:
         while True:
@@ -578,6 +618,8 @@ class TeacherDeployServer:
         pc_id: Optional[str] = None
         owned_generation = 0
         file_obj = None
+        broadcast_sock_to_close: Optional[socket.socket] = None
+        broadcast_audio_sock_to_close: Optional[socket.socket] = None
         try:
             file_obj = client_sock.makefile("rb")
             while True:
@@ -717,6 +759,13 @@ class TeacherDeployServer:
                         if client is not None:
                             client.control_sock = None
                             client.online = False
+                            if client.broadcast_sock is not None:
+                                broadcast_sock_to_close = client.broadcast_sock
+                                client.broadcast_sock = None
+                            if client.broadcast_audio_sock is not None:
+                                broadcast_audio_sock_to_close = client.broadcast_audio_sock
+                                client.broadcast_audio_sock = None
+                            self.broadcast_target_ids.discard(pc_id)
                         if client is not None:
                             now_ts = time.time()
                             if client.current_user:
@@ -735,6 +784,16 @@ class TeacherDeployServer:
                     self._stop_recording(pc_id, status="disconnected")
                 self._put_bounded(self.status_queue, pc_id)
                 self._log_event("control_disconnected", pc_id=pc_id)
+            if broadcast_sock_to_close is not None:
+                try:
+                    broadcast_sock_to_close.close()
+                except OSError:
+                    pass
+            if broadcast_audio_sock_to_close is not None:
+                try:
+                    broadcast_audio_sock_to_close.close()
+                except OSError:
+                    pass
             client_sock.close()
 
     def _valid_student_number(self, value: str) -> bool:
@@ -1314,27 +1373,267 @@ class TeacherDeployServer:
                 self.udp_send_sock = None
                 return False
 
+    def _broadcast_profile(self) -> tuple[int, int, int]:
+        profile_map = {"360p": (640, 360, 60), "720p": (1280, 720, 80), "1080p": (1920, 1080, 90)}
+        return profile_map.get(self.settings.main_stream_profile, profile_map["720p"])
+
+    def _ensure_broadcast_loop(self) -> None:
+        if self.broadcast_thread is not None and self.broadcast_thread.is_alive():
+            return
+        self.broadcast_stop_event.clear()
+        self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, daemon=True)
+        self.broadcast_thread.start()
+
+    def _ensure_broadcast_audio_loop(self) -> None:
+        if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive():
+            return
+        self.broadcast_audio_stop_event.clear()
+        self.broadcast_audio_thread = threading.Thread(target=self._run_broadcast_audio_loop, daemon=True)
+        self.broadcast_audio_thread.start()
+
+    def _run_broadcast_loop(self) -> None:
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                while not self.broadcast_stop_event.is_set():
+                    with self.lock:
+                        target_ids = list(self.broadcast_target_ids)
+                    if not target_ids:
+                        break
+
+                    width, height, jpeg_quality = self._broadcast_profile()
+                    shot = sct.grab(monitor)
+                    frame = cv2.cvtColor(numpy.array(shot), cv2.COLOR_BGRA2BGR)
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        frame = cv2.resize(frame, (width, height))
+                    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+                    if not ok:
+                        time.sleep(0.2)
+                        continue
+
+                    frame_bytes = jpeg.tobytes()
+                    recipients: list[tuple[str, socket.socket]] = []
+                    with self.lock:
+                        for pc_id in target_ids:
+                            client = self.clients.get(pc_id)
+                            if not client or not client.online or client.broadcast_sock is None:
+                                continue
+                            recipients.append((pc_id, client.broadcast_sock))
+
+                    failed_ids: list[str] = []
+                    failed_socks: list[socket.socket] = []
+                    for pc_id, client_sock in recipients:
+                        try:
+                            send_frame(client_sock, frame_bytes)
+                        except OSError:
+                            failed_ids.append(pc_id)
+                            failed_socks.append(client_sock)
+
+                    if failed_ids:
+                        with self.lock:
+                            for pc_id, failed_sock in zip(failed_ids, failed_socks):
+                                client = self.clients.get(pc_id)
+                                if client and client.broadcast_sock is failed_sock:
+                                    client.broadcast_sock = None
+                                self.broadcast_target_ids.discard(pc_id)
+                                self._put_bounded(self.status_queue, pc_id)
+                        for failed_sock in failed_socks:
+                            try:
+                                failed_sock.close()
+                            except OSError:
+                                pass
+
+                    time.sleep(1 / max(1, RUNTIME.max_fps))
+        except Exception as exc:
+            self._log_event("broadcast_loop_error", reason=str(exc))
+        finally:
+            self.broadcast_stop_event.set()
+
+    def _run_broadcast_audio_loop(self) -> None:
+        if sd is None:
+            self._log_event("broadcast_audio_unavailable", reason="sounddevice_not_installed")
+            return
+        while not self.broadcast_audio_stop_event.is_set():
+            with self.lock:
+                target_ids = list(self.broadcast_target_ids)
+            if not target_ids:
+                break
+            try:
+                with sd.InputStream(
+                    samplerate=AUDIO_SAMPLE_RATE,
+                    channels=AUDIO_CHANNELS,
+                    dtype=AUDIO_DTYPE,
+                    blocksize=AUDIO_BLOCK_SIZE,
+                ) as stream:
+                    while not self.broadcast_audio_stop_event.is_set():
+                        with self.lock:
+                            target_ids = list(self.broadcast_target_ids)
+                        if not target_ids:
+                            return
+                        audio_chunk, _overflowed = stream.read(AUDIO_BLOCK_SIZE)
+                        audio_bytes = numpy.asarray(audio_chunk, dtype=numpy.int16).tobytes()
+                        recipients: list[tuple[str, socket.socket]] = []
+                        with self.lock:
+                            for pc_id in target_ids:
+                                client = self.clients.get(pc_id)
+                                if not client or not client.online or client.broadcast_audio_sock is None:
+                                    continue
+                                recipients.append((pc_id, client.broadcast_audio_sock))
+
+                        failed_socks: list[socket.socket] = []
+                        for pc_id, client_sock in recipients:
+                            try:
+                                send_frame(client_sock, audio_bytes)
+                            except OSError:
+                                failed_socks.append(client_sock)
+                                with self.lock:
+                                    client = self.clients.get(pc_id)
+                                    if client and client.broadcast_audio_sock is client_sock:
+                                        client.broadcast_audio_sock = None
+                                        self._put_bounded(self.status_queue, pc_id)
+                        for failed_sock in failed_socks:
+                            try:
+                                failed_sock.close()
+                            except OSError:
+                                pass
+            except Exception as exc:
+                self._log_event("broadcast_audio_error", reason=str(exc))
+                if self.broadcast_audio_stop_event.wait(1.0):
+                    break
+        self.broadcast_audio_stop_event.set()
+
+    def start_broadcast(self, targets: list[str]) -> list[str]:
+        with self.lock:
+            eligible = [
+                pc_id for pc_id in targets
+                if pc_id in self.clients and self.clients[pc_id].online and self.clients[pc_id].control_sock is not None
+            ]
+            self.broadcast_target_ids.update(eligible)
+        if not eligible:
+            return []
+        started: list[str] = []
+        failed: list[str] = []
+        for pc_id in eligible:
+            cmd_id = self.send_command(pc_id, "BROADCAST_START")
+            if cmd_id:
+                started.append(pc_id)
+                self._put_bounded(self.status_queue, pc_id)
+            else:
+                failed.append(pc_id)
+        if failed:
+            with self.lock:
+                for pc_id in failed:
+                    self.broadcast_target_ids.discard(pc_id)
+        if not started:
+            return []
+        self._ensure_broadcast_loop()
+        self._ensure_broadcast_audio_loop()
+        self._log_event("broadcast_started", targets=",".join(sorted(started)))
+        return started
+
+    def stop_broadcast(self, targets: Optional[list[str]] = None) -> list[str]:
+        sockets_to_close: list[socket.socket] = []
+        with self.lock:
+            current = set(self.broadcast_target_ids)
+            if targets is None:
+                target_set = current
+            else:
+                target_set = current.intersection(targets)
+            for pc_id in target_set:
+                client = self.clients.get(pc_id)
+                if client and client.broadcast_sock is not None:
+                    sockets_to_close.append(client.broadcast_sock)
+                    client.broadcast_sock = None
+                if client and client.broadcast_audio_sock is not None:
+                    sockets_to_close.append(client.broadcast_audio_sock)
+                    client.broadcast_audio_sock = None
+                self.broadcast_target_ids.discard(pc_id)
+        if not self.broadcast_target_ids:
+            self.broadcast_stop_event.set()
+            self.broadcast_audio_stop_event.set()
+        for client_sock in sockets_to_close:
+            try:
+                client_sock.close()
+            except OSError:
+                pass
+        for pc_id in sorted(target_set):
+            self.send_command(pc_id, "BROADCAST_STOP")
+            self._put_bounded(self.status_queue, pc_id)
+        if target_set:
+            self._log_event("broadcast_stopped", targets=",".join(sorted(target_set)))
+        return sorted(target_set)
+
     def _video_client_loop(self, client_sock: socket.socket) -> None:
         pc_id: Optional[str] = None
         file_obj = None
+        role = "uplink"
         try:
             file_obj = client_sock.makefile("rb")
             reg = recv_json_line(file_obj)
             if not reg or reg.get("type") != "video_register":
                 return
             pc_id = str(reg.get("pc_id", ""))
+            role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
             with self.lock:
                 if pc_id not in self.clients:
                     return
                 client = self.clients[pc_id]
-                if client.video_sock and client.video_sock is not client_sock:
-                    try:
-                        client.video_sock.close()
-                    except OSError:
-                        pass
-                client.video_generation += 1
-                owned_video_generation = client.video_generation
-                client.video_sock = client_sock
+                if role == "broadcast_downlink":
+                    if client.broadcast_sock and client.broadcast_sock is not client_sock:
+                        try:
+                            client.broadcast_sock.close()
+                        except OSError:
+                            pass
+                    client.broadcast_generation += 1
+                    owned_video_generation = client.broadcast_generation
+                    client.broadcast_sock = client_sock
+                elif role == "broadcast_audio_downlink":
+                    if client.broadcast_audio_sock and client.broadcast_audio_sock is not client_sock:
+                        try:
+                            client.broadcast_audio_sock.close()
+                        except OSError:
+                            pass
+                    client.broadcast_audio_generation += 1
+                    owned_video_generation = client.broadcast_audio_generation
+                    client.broadcast_audio_sock = client_sock
+                else:
+                    if client.video_sock and client.video_sock is not client_sock:
+                        try:
+                            client.video_sock.close()
+                        except OSError:
+                            pass
+                    client.video_generation += 1
+                    owned_video_generation = client.video_generation
+                    client.video_sock = client_sock
+            if role == "broadcast_downlink":
+                self._log_event("broadcast_video_registered", pc_id=pc_id)
+                while True:
+                    with self.lock:
+                        client = self.clients.get(pc_id or "")
+                        if (
+                            not client
+                            or client.broadcast_generation != owned_video_generation
+                            or client.broadcast_sock is not client_sock
+                            or pc_id not in self.broadcast_target_ids
+                        ):
+                            break
+                    time.sleep(0.5)
+                return
+            if role == "broadcast_audio_downlink":
+                self._log_event("broadcast_audio_registered", pc_id=pc_id)
+                while True:
+                    with self.lock:
+                        client = self.clients.get(pc_id or "")
+                        if (
+                            not client
+                            or client.broadcast_audio_generation != owned_video_generation
+                            or client.broadcast_audio_sock is not client_sock
+                            or pc_id not in self.broadcast_target_ids
+                        ):
+                            break
+                    time.sleep(0.5)
+                return
+
             self._log_event("video_registered", pc_id=pc_id)
             while True:
                 with self.lock:
@@ -1381,11 +1680,24 @@ class TeacherDeployServer:
             if pc_id:
                 with self.lock:
                     if pc_id in self.clients:
-                        if self.clients[pc_id].video_sock is client_sock:
-                            self.clients[pc_id].video_sock = None
-                    self.video_status_last_ts_by_pc.pop(pc_id, None)
+                        if role == "broadcast_downlink":
+                            if self.clients[pc_id].broadcast_sock is client_sock:
+                                self.clients[pc_id].broadcast_sock = None
+                        elif role == "broadcast_audio_downlink":
+                            if self.clients[pc_id].broadcast_audio_sock is client_sock:
+                                self.clients[pc_id].broadcast_audio_sock = None
+                        else:
+                            if self.clients[pc_id].video_sock is client_sock:
+                                self.clients[pc_id].video_sock = None
+                    if role not in {"broadcast_downlink", "broadcast_audio_downlink"}:
+                        self.video_status_last_ts_by_pc.pop(pc_id, None)
                 self._put_bounded(self.status_queue, pc_id)
-                self._log_event("video_disconnected", pc_id=pc_id)
+                if role == "broadcast_downlink":
+                    self._log_event("broadcast_video_disconnected", pc_id=pc_id)
+                elif role == "broadcast_audio_downlink":
+                    self._log_event("broadcast_audio_disconnected", pc_id=pc_id)
+                else:
+                    self._log_event("video_disconnected", pc_id=pc_id)
             client_sock.close()
 
     def _run_sensor_server(self) -> None:
@@ -1621,7 +1933,9 @@ class TeacherDeployServer:
                 "max_fps": RUNTIME.max_fps,
             })
 
-    def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None) -> Optional[str]:
+    def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None, *, allow_udp_fallback: bool = True) -> Optional[str]:
+        if command in {"SHUTDOWN", "RESTART"}:
+            allow_udp_fallback = False
         with self.lock:
             client = self.clients.get(pc_id)
             if not client:
@@ -1646,7 +1960,7 @@ class TeacherDeployServer:
                 return cmd_id
             except OSError:
                 pass
-        if peer_ip:
+        if allow_udp_fallback and peer_ip:
             try:
                 if not self._send_udp_fallback(msg, peer_ip):
                     return None
@@ -1655,6 +1969,28 @@ class TeacherDeployServer:
             except OSError:
                 return None
         return None
+
+    def shutdown_targets(self, targets: list[str]) -> list[str]:
+        with self.lock:
+            eligible = [
+                pc_id for pc_id in targets
+                if pc_id in self.clients and self.clients[pc_id].online and self.clients[pc_id].control_sock is not None
+            ]
+        for pc_id in eligible:
+            self.send_command(pc_id, "SHUTDOWN", allow_udp_fallback=False)
+            self._put_bounded(self.status_queue, pc_id)
+        return eligible
+
+    def restart_targets(self, targets: list[str]) -> list[str]:
+        with self.lock:
+            eligible = [
+                pc_id for pc_id in targets
+                if pc_id in self.clients and self.clients[pc_id].online and self.clients[pc_id].control_sock is not None
+            ]
+        for pc_id in eligible:
+            self.send_command(pc_id, "RESTART", allow_udp_fallback=False)
+            self._put_bounded(self.status_queue, pc_id)
+        return eligible
 
     def lock_targets(self, targets: list[str], signout: bool = False) -> None:
         payload = {"lock_mode": "signout" if signout else "temporary"}
@@ -1873,6 +2209,8 @@ class TeacherDeployUI:
         self.root.geometry(f"{init_w}x{init_h}+20+20")
         self.root.after(0, lambda: self.root.state("zoomed"))
         self.root.configure(fg_color=UI_BG)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
+        self.root.report_callback_exception = self._report_tk_callback_exception
 
         self.selected_pc: Optional[str] = None
         self.tiles: dict[str, dict[str, object]] = {}
@@ -1885,6 +2223,8 @@ class TeacherDeployUI:
         self._drain_rr_index: int = 0
         self.chat_sidebar_window: Optional[ctk.CTkToplevel] = None
         self.chat_sidebar_body: Optional[ctk.CTkScrollableFrame] = None
+        self._runtime_notice_default = "Runtime monitor active."
+        self._runtime_notice_until_ts = 0.0
         self.student_management_panel = StudentManagementPanel(
             parent=self.root,
             auth_db=self.server.auth_db,
@@ -1903,50 +2243,81 @@ class TeacherDeployUI:
         # =========================
         # 1) TOP BAR (Fixed Height = 160) — SENSOR PANEL
         # =========================
-        top = ctk.CTkFrame(self.root, height=110, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        top = ctk.CTkFrame(self.root, height=122, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.top_bar = top
-        top.pack(fill="x", padx=10, pady=(8, 6))
+        top.pack(fill="x", padx=12, pady=(10, 6))
         top.pack_propagate(False)
 
         title_row = ctk.CTkFrame(top, fg_color="transparent")
-        title_row.pack(fill="x", padx=14, pady=(8, 6))
+        title_row.pack(fill="x", padx=16, pady=(10, 6))
+        # UI POLISH ONLY
         self.top_title_label = ctk.CTkLabel(
             title_row,
-            text="Selected PC Sensors",
-            font=("Arial", 16, "bold"),
+            text="Selected Workstation Overview",
+            font=(self.FONT_FAMILY, 17, "bold"),
             text_color=TEXT_PRIMARY
         )
         self.top_title_label.pack(side="left")
-        self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, **BUTTON_NEUTRAL)
+        self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, height=34, **BUTTON_NEUTRAL)
         self.settings_button.pack(side="right", padx=(8, 0))
+        self.stop_broadcast_btn = ctk.CTkButton(
+            title_row,
+            text="Stop Broadcast",
+            command=self._stop_broadcast_targets,
+            width=140,
+            height=34,
+            **BUTTON_NEUTRAL,
+        )
+        self.stop_broadcast_btn.pack(side="right", padx=(8, 0))
+        self.broadcast_btn = ctk.CTkButton(
+            title_row,
+            text="Start Broadcast",
+            command=self._start_broadcast_targets,
+            width=140,
+            height=34,
+            **BUTTON_WARNING,
+        )
+        self.broadcast_btn.pack(side="right", padx=(8, 0))
         self.reservations_button = ctk.CTkButton(
             title_row,
             text="Reservations",
             command=self._open_reservation_management,
             width=120,
+            height=34,
             **BUTTON_NEUTRAL,
         )
         self.reservations_button.pack(side="right", padx=(8, 0))
+        self.chat_btn = ctk.CTkButton(
+            title_row,
+            text="Chat",
+            command=self._open_chat_sidebar,
+            width=120,
+            height=34,
+            **BUTTON_NEUTRAL,
+        )
+        self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
         self.students_button = ctk.CTkButton(
             title_row,
             text="Students",
             command=self._open_student_management,
             width=100,
+            height=34,
             **BUTTON_NEUTRAL,
         )
         self.students_button.pack(side="right", padx=(8, 0))
         self.selected_history_button = ctk.CTkButton(
             title_row,
-            text="Selected PC History",
+            text="View Selected History",
             command=self._open_selected_history,
-            width=160,
+            width=170,
+            height=34,
             state="disabled",
             **BUTTON_NEUTRAL,
         )
         self.selected_history_button.pack(side="right")
 
         sensor_row = ctk.CTkFrame(top, fg_color="transparent")
-        sensor_row.pack(fill="x", padx=20, pady=(0, 10))
+        sensor_row.pack(fill="x", padx=18, pady=(0, 12))
 
         self.sensor_value_labels: dict[str, ctk.CTkLabel] = {}
         self.sensor_title_labels: list[ctk.CTkLabel] = []
@@ -1991,8 +2362,21 @@ class TeacherDeployUI:
         middle.pack(fill="both", expand=True, padx=8, pady=6)
 
         # LEFT SIDE — MAIN VIDEO
-        self.large_view = ctk.CTkLabel(middle, text="No selection", anchor="center", fg_color="transparent", text_color=TEXT_SECONDARY, corner_radius=8)
-        self.large_view.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.large_view_host = ctk.CTkFrame(middle, fg_color="transparent")
+        self.large_view_host.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.large_view_host.pack_propagate(False)
+        self.large_view = ctk.CTkLabel(
+            self.large_view_host,
+            text="Select a workstation to view its live feed.",
+            anchor="center",
+            justify="center",
+            wraplength=520,
+            font=(self.FONT_FAMILY, 18, "bold"),
+            fg_color="transparent",
+            text_color=TEXT_SECONDARY,
+            corner_radius=8,
+        )
+        self.large_view.pack(fill="both", expand=True)
 
         # RIGHT SIDE — PREVIEW GRID (Fixed Width 400)
         self.grid_scroll = ctk.CTkScrollableFrame(middle, width=400, fg_color="transparent", border_width=1, border_color=BORDER_SUBTLE)
@@ -2002,43 +2386,80 @@ class TeacherDeployUI:
         # =========================
         # 3) BOTTOM BAR (Fixed Height = 160) — UNCHANGED
         # =========================
-        bottom = ctk.CTkFrame(self.root, height=70, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
+        bottom = ctk.CTkFrame(self.root, height=86, fg_color=CARD_BG, border_width=1, border_color=BORDER_SUBTLE)
         self.bottom_bar = bottom
         bottom.pack(fill="x", padx=10, pady=(6, 8))
         bottom.pack_propagate(False)
 
         self.targets_frame = ctk.CTkScrollableFrame(bottom, width=450, fg_color=CARD_BG)
-        self.targets_frame.pack(side="left", fill="both", expand=False, padx=8, pady=8)
+        self.targets_frame.pack(side="left", fill="both", expand=False, padx=8, pady=10)
 
         self.left_controls_frame = ctk.CTkFrame(bottom, fg_color=CARD_BG)
-        self.left_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=8)
+        self.left_controls_frame.pack(side="left", fill="both", expand=True, padx=12, pady=10)
 
-        self.right_controls_frame = ctk.CTkFrame(bottom, width=136, fg_color=CARD_BG)
-        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=8)
+        self.right_controls_frame = ctk.CTkFrame(bottom, width=190, fg_color=CARD_BG)
+        self.right_controls_frame.pack(side="right", fill="y", expand=False, padx=(4, 10), pady=10)
         self.right_controls_frame.pack_propagate(False)
 
         action_group = ctk.CTkFrame(self.left_controls_frame, fg_color="transparent")
         action_group.pack(side="left", padx=(8, 16))
+        self.lock_mode_label = ctk.CTkLabel(action_group, text="Action Mode", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
+        self.lock_mode_label.pack(side="left", padx=(0, 6))
         self.lock_mode_var = ctk.StringVar(value="Temporary Lock")
-        ctk.CTkOptionMenu(action_group, variable=self.lock_mode_var, values=["Temporary Lock", "Lock + Sign Out"], width=170).pack(side="left", padx=4)
-        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=140, **BUTTON_PRIMARY)
+        self.lock_mode_menu = ctk.CTkOptionMenu(
+            action_group,
+            variable=self.lock_mode_var,
+            values=["Temporary Lock", "Lock + Sign Out", "Shutdown", "Restart"],
+            width=178,
+            height=34,
+        )
+        self.lock_mode_menu.pack(side="left", padx=4)
+        self.lock_btn = ctk.CTkButton(action_group, text="Apply Lock Mode", command=self._lock_targets, width=150, height=34, **BUTTON_PRIMARY)
         self.lock_btn.pack(side="left", padx=4)
-        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=110, **BUTTON_NEUTRAL)
+        self.unlock_btn = ctk.CTkButton(action_group, text="Unlock", command=self._unlock_targets, width=110, height=34, **BUTTON_NEUTRAL)
         self.unlock_btn.pack(side="left", padx=4)
+        self.lock_mode_var.trace_add("write", lambda *_args: self._refresh_control_buttons())
 
         timer_group = ctk.CTkFrame(self.left_controls_frame, fg_color="transparent")
         timer_group.pack(side="left", padx=(12, 6))
-        self.timer_title_label = ctk.CTkLabel(timer_group, text="Timer:", font=("Arial", 12, "bold"), text_color=TEXT_SECONDARY)
+        self.timer_title_label = ctk.CTkLabel(timer_group, text="Extend Session", font=(self.FONT_FAMILY, 12, "bold"), text_color=TEXT_SECONDARY)
         self.timer_title_label.pack(side="left", padx=(0, 8))
-        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="min", width=80, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
+        self.timer_entry = ctk.CTkEntry(timer_group, placeholder_text="Minutes", width=92, height=34, fg_color="#FAFAFA", border_color=BORDER_SUBTLE, text_color=TEXT_PRIMARY)
         self.timer_entry.pack(side="left", padx=4)
-        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=92, **BUTTON_WARNING)
+        self.extend_timer_btn = ctk.CTkButton(timer_group, text="Extend", command=self._extend_timer, width=96, height=34, **BUTTON_WARNING)
         self.extend_timer_btn.pack(side="left", padx=4)
-        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=92, **BUTTON_NEUTRAL)
+        self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=96, height=34, **BUTTON_NEUTRAL)
         self.cancel_timer_btn.pack(side="left", padx=4)
 
-        self.chat_btn = ctk.CTkButton(timer_group, text="Chat", command=self._open_chat_sidebar, width=120, **BUTTON_NEUTRAL)
-        self.chat_btn.pack(side="left", padx=(6, 4))
+        self.dashboard_hint_title = ctk.CTkLabel(
+            self.right_controls_frame,
+            text="Quick Guide",
+            font=(self.FONT_FAMILY, 12, "bold"),
+            text_color=TEXT_PRIMARY,
+            anchor="w",
+            justify="left",
+        )
+        self.dashboard_hint_title.pack(fill="x", padx=10, pady=(6, 2))
+        self.dashboard_hint_label = ctk.CTkLabel(
+            self.right_controls_frame,
+            text="Select a tile to focus it.\nTick one or more targets.\nBroadcast works on online PCs.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=160,
+        )
+        self.dashboard_hint_label.pack(fill="x", padx=10, pady=(0, 6))
+        self.runtime_notice_label = ctk.CTkLabel(
+            self.right_controls_frame,
+            text=self._runtime_notice_default,
+            font=(self.FONT_FAMILY, 11),
+            text_color=TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=160,
+        )
+        self.runtime_notice_label.pack(fill="x", padx=10, pady=(0, 6))
 
         # self.approve_ext_btn = ctk.CTkButton(self.left_controls_frame, text="Approve Extension", command=self._approve_extension_selected, width=140, **BUTTON_WARNING)
         # self.approve_ext_btn.pack(side="right", padx=4, pady=8)
@@ -2086,8 +2507,16 @@ class TeacherDeployUI:
             self.large_view.configure(fg_color="transparent", text_color=colors["text_secondary"])
         if hasattr(self, "top_title_label"):
             self.top_title_label.configure(text_color=colors["text_primary"])
+        if hasattr(self, "lock_mode_label"):
+            self.lock_mode_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "timer_title_label"):
             self.timer_title_label.configure(text_color=colors["text_secondary"])
+        if hasattr(self, "dashboard_hint_title"):
+            self.dashboard_hint_title.configure(text_color=colors["text_primary"])
+        if hasattr(self, "dashboard_hint_label"):
+            self.dashboard_hint_label.configure(text_color=colors["text_secondary"])
+        if hasattr(self, "runtime_notice_label") and (time.time() >= getattr(self, "_runtime_notice_until_ts", 0.0)):
+            self.runtime_notice_label.configure(text_color=colors["text_secondary"])
         if hasattr(self, "timer_entry"):
             entry_bg = "#262d38" if ctk.get_appearance_mode().lower() == "dark" else "#FAFAFA"
             self.timer_entry.configure(fg_color=entry_bg, text_color=colors["text_primary"], border_color=colors["border"])
@@ -2137,6 +2566,29 @@ class TeacherDeployUI:
         if changed:
             widget.configure(**changed)
 
+    def _set_runtime_notice(self, text: str, text_color: Optional[str] = None, hold_s: float = 0.0) -> None:
+        color = text_color or self._theme_palette()["text_secondary"]
+        if hasattr(self, "runtime_notice_label"):
+            self._configure_if_changed(self.runtime_notice_label, text=text, text_color=color)
+        self._runtime_notice_until_ts = (time.time() + max(0.0, float(hold_s))) if hold_s > 0 else 0.0
+
+    def _refresh_runtime_notice(self) -> None:
+        if self._runtime_notice_until_ts and time.time() >= self._runtime_notice_until_ts:
+            self._runtime_notice_until_ts = 0.0
+            self._set_runtime_notice(self._runtime_notice_default, self._theme_palette()["text_secondary"])
+
+    def _report_tk_callback_exception(self, exc, val, tb) -> None:
+        detail = "".join(traceback.format_exception(exc, val, tb))[-4000:]
+        self.server._log_event("ui_callback_error", detail=detail)
+        self._set_runtime_notice("Dashboard recovered after a UI callback issue.", ESSU_WARNING, hold_s=20.0)
+
+    def _on_close_requested(self) -> None:
+        if messagebox.askyesno(
+            "Exit Admin Dashboard",
+            "Closing this window also stops the lab server for the computer lab.\n\nDo you want to exit?",
+        ):
+            self.root.destroy()
+
 
 
     def _font(self, size: int) -> ImageFont.ImageFont:
@@ -2168,6 +2620,24 @@ class TeacherDeployUI:
             second_y = y + 36
             draw.text((x + shadow_offset, second_y + shadow_offset), client.current_user, font=font, fill=(0, 0, 0, 120))
             draw.text((x, second_y), client.current_user, font=font, fill=(255, 255, 255, 220))
+        return canvas.convert("RGB")
+
+    def _apply_preview_status_dot(self, image: Image.Image, color: str) -> Image.Image:
+        canvas = image.convert("RGBA")
+        draw = ImageDraw.Draw(canvas)
+        dot_color = str(color or "").strip()
+        if not (dot_color.startswith("#") and len(dot_color) == 7):
+            dot_color = "#FFFFFF"
+        r = 6
+        cx = 18
+        cy = 18
+        fill = (
+            int(dot_color[1:3], 16),
+            int(dot_color[3:5], 16),
+            int(dot_color[5:7], 16),
+            235,
+        )
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=fill)
         return canvas.convert("RGB")
 
     def _apply_main_overlay(self, image: Image.Image, pc_id: str) -> Image.Image:
@@ -2204,6 +2674,7 @@ class TeacherDeployUI:
         preview.pack(fill="both", expand=True, padx=6, pady=6)
         indicator = ctk.CTkLabel(tile, text="●", font=("Arial", 14, "bold"), text_color=colors["text_secondary"], fg_color="transparent")
         indicator.place(x=8, y=6)
+        indicator.configure(text="")
         tile.bind("<Button-1>", lambda _e, pid=pc_id: self._select_pc(pid))
         preview.bind("<Button-1>", lambda _e, pid=pc_id: self._select_pc(pid))
 
@@ -2245,28 +2716,52 @@ class TeacherDeployUI:
         with self.server.lock:
             return [pc for pc in targets if (pc in self.server.clients and self.server.clients[pc].lock_reason == "manual")]
 
+    def _online_targets(self, targets: list[str]) -> list[str]:
+        with self.server.lock:
+            return [pc for pc in targets if (pc in self.server.clients and self.server.clients[pc].online)]
+
+    def _broadcasting_targets(self, targets: list[str]) -> list[str]:
+        with self.server.lock:
+            active = set(self.server.broadcast_target_ids)
+        return [pc for pc in targets if pc in active]
+
     def _refresh_control_buttons(self) -> None:
         targets = self._selected_targets()
         logged = self._logged_in_targets(targets)
         temp_locked = self._temporary_locked_targets(targets)
+        online = self._online_targets(targets)
+        broadcasting = self._broadcasting_targets(targets)
+        mode = self.lock_mode_var.get()
 
-        can_lock = bool(logged)
+        if mode in {"Shutdown", "Restart"}:
+            can_lock = bool(online)
+            primary_text = "Shutdown PCs" if mode == "Shutdown" else "Restart PCs"
+        else:
+            can_lock = bool(logged)
+            primary_text = "Apply Lock Mode"
         can_unlock = bool(temp_locked)
         can_extend = len(logged) == 1
         selected_ext = int(self.extended_timer_ms_by_pc.get(logged[0], 0)) if len(logged) == 1 else 0
         can_cancel = len(logged) == 1 and selected_ext > 0
+        broadcasting_set = set(broadcasting)
+        startable_targets = [pc for pc in online if pc not in broadcasting_set]
+        stoppable_targets = [pc for pc in online if pc in broadcasting_set]
+        can_broadcast = bool(startable_targets)
+        can_stop_broadcast = bool(stoppable_targets)
 
-        self._configure_if_changed(self.lock_btn, state="normal" if can_lock else "disabled")
+        self._configure_if_changed(self.lock_btn, text=primary_text, state="normal" if can_lock else "disabled")
         self._configure_if_changed(self.unlock_btn, state="normal" if can_unlock else "disabled")
         self._configure_if_changed(self.extend_timer_btn, state="normal" if can_extend else "disabled")
         self._configure_if_changed(self.cancel_timer_btn, state="normal" if can_cancel else "disabled")
+        self._configure_if_changed(self.broadcast_btn, text="Start Broadcast", state="normal" if can_broadcast else "disabled")
+        self._configure_if_changed(self.stop_broadcast_btn, text="Stop Broadcast", state="normal" if can_stop_broadcast else "disabled")
 
         # can_ext_approve = bool(self.server.settings.enable_extension_requests) and len(logged) == 1
         # self._configure_if_changed(self.approve_ext_btn, state="normal" if can_ext_approve else "disabled")
 
         if bool(self.server.settings.enable_session_messaging):
             if self.chat_btn.winfo_manager() != "pack":
-                self.chat_btn.pack(side="left", padx=(6, 4))
+                self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
             self._configure_if_changed(self.chat_btn, state="normal")
         else:
             if self.chat_btn.winfo_manager():
@@ -2277,11 +2772,18 @@ class TeacherDeployUI:
             self.chat_sidebar_body = None
 
     def _lock_targets(self) -> None:
+        mode = self.lock_mode_var.get()
+        if mode == "Shutdown":
+            self._shutdown_targets()
+            return
+        if mode == "Restart":
+            self._restart_targets()
+            return
         targets = self._selected_targets()
         logged_targets = self._logged_in_targets(targets)
         if not logged_targets:
             return
-        signout = self.lock_mode_var.get() == "Lock + Sign Out"
+        signout = mode == "Lock + Sign Out"
         self.server.lock_targets(logged_targets, signout=signout)
         self._refresh_control_buttons()
 
@@ -2307,6 +2809,54 @@ class TeacherDeployUI:
         if not temp_locked:
             return
         self.server.unlock_targets(temp_locked)
+        self._refresh_control_buttons()
+
+    def _start_broadcast_targets(self) -> None:
+        targets = self._selected_targets()
+        online_targets = self._online_targets(targets)
+        if not online_targets:
+            return
+        self.server.start_broadcast(online_targets)
+        self._refresh_control_buttons()
+
+    def _stop_broadcast_targets(self) -> None:
+        targets = self._selected_targets()
+        broadcasting = self._broadcasting_targets(targets)
+        if not broadcasting:
+            return
+        self.server.stop_broadcast(broadcasting)
+        self._refresh_control_buttons()
+
+    def _toggle_broadcast_targets(self) -> None:
+        targets = self._selected_targets()
+        online_targets = self._online_targets(targets)
+        if not online_targets:
+            return
+        broadcasting = self._broadcasting_targets(online_targets)
+        if broadcasting and len(broadcasting) == len(online_targets):
+            self.server.stop_broadcast(broadcasting)
+        else:
+            self.server.start_broadcast(online_targets)
+        self._refresh_control_buttons()
+
+    def _shutdown_targets(self) -> None:
+        targets = self._selected_targets()
+        online_targets = self._online_targets(targets)
+        if not online_targets:
+            return
+        if not messagebox.askyesno("Shutdown PCs", f"Shutdown the selected workstation(s): {', '.join(online_targets)}?"):
+            return
+        self.server.shutdown_targets(online_targets)
+        self._refresh_control_buttons()
+
+    def _restart_targets(self) -> None:
+        targets = self._selected_targets()
+        online_targets = self._online_targets(targets)
+        if not online_targets:
+            return
+        if not messagebox.askyesno("Restart PCs", f"Restart the selected workstation(s): {', '.join(online_targets)}?"):
+            return
+        self.server.restart_targets(online_targets)
         self._refresh_control_buttons()
 
     def _timer_minutes_from_input(self) -> Optional[float]:
@@ -2597,6 +3147,9 @@ class TeacherDeployUI:
         modal_h = min(640, int(screen_h * 0.86))
         win.geometry(f"{modal_w}x{modal_h}")
         win.transient(self.root)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
         win.bind("<Escape>", lambda _e: win.destroy())
         colors = self._apply_theme_to_toplevel(win)
         self.root.update_idletasks()
@@ -2614,11 +3167,25 @@ class TeacherDeployUI:
         day_keys: list[str] = []
         grouped_by_day: dict[str, list[dict]] = {}
         current_visible_rows: list[dict] = []
+        summary_var = ctk.StringVar(value=f"{len(source_records)} record(s) loaded. Use Play to open saved recordings.")
 
         header = ctk.CTkFrame(win, fg_color=colors["card_bg"], border_width=1, border_color=colors["border"])
         header.pack(fill="x", padx=10, pady=(10, 6))
         title_var = ctk.StringVar(value=title)
-        ctk.CTkLabel(header, textvariable=title_var, font=(self.FONT_FAMILY, 16, "bold"), text_color=colors["text_primary"]).pack(anchor="w", padx=12, pady=10)
+        ctk.CTkLabel(header, textvariable=title_var, font=(self.FONT_FAMILY, 16, "bold"), text_color=colors["text_primary"]).pack(anchor="w", padx=12, pady=(10, 4))
+        # UI POLISH ONLY
+        ctk.CTkLabel(
+            header,
+            text="Filter by student, section, or date. Saved recordings stay available in the Recording column.",
+            font=(self.FONT_FAMILY, 12),
+            text_color=colors["text_secondary"],
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(
+            header,
+            textvariable=summary_var,
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+        ).pack(anchor="w", padx=12, pady=(0, 10))
 
         filter_bar = ctk.CTkFrame(win, fg_color=colors["card_bg"], border_width=1, border_color=colors["border"])
         filter_bar.pack(fill="x", padx=10, pady=(0, 6))
@@ -2628,21 +3195,21 @@ class TeacherDeployUI:
         page_label = ctk.CTkLabel(filter_bar, text="Page 1/1", text_color=colors["text_secondary"])
 
         ctk.CTkLabel(filter_bar, text="Search", text_color=colors["text_primary"]).pack(side="left", padx=(10, 4), pady=8)
-        search_entry = ctk.CTkEntry(filter_bar, textvariable=search_var, width=220)
+        search_entry = ctk.CTkEntry(filter_bar, textvariable=search_var, width=220, height=34, placeholder_text="Name, student no., or PC")
         search_entry.pack(side="left", padx=4)
         ctk.CTkLabel(filter_bar, text="Section", text_color=colors["text_primary"]).pack(side="left", padx=(10, 4))
-        section_entry = ctk.CTkEntry(filter_bar, textvariable=section_var, width=140)
+        section_entry = ctk.CTkEntry(filter_bar, textvariable=section_var, width=140, height=34, placeholder_text="e.g. BSIT 2A")
         section_entry.pack(side="left", padx=4)
         ctk.CTkLabel(filter_bar, text="Date (YYYY-MM-DD)", text_color=colors["text_primary"]).pack(side="left", padx=(10, 4))
-        date_entry = ctk.CTkEntry(filter_bar, textvariable=date_var, width=140)
+        date_entry = ctk.CTkEntry(filter_bar, textvariable=date_var, width=140, height=34, placeholder_text="YYYY-MM-DD")
         date_entry.pack(side="left", padx=4)
 
         pager = ctk.CTkFrame(filter_bar, fg_color="transparent")
         pager.pack(side="right", padx=10)
-        prev_btn = ctk.CTkButton(pager, text="Prev", width=60, **BUTTON_NEUTRAL)
+        prev_btn = ctk.CTkButton(pager, text="Prev", width=72, height=34, **BUTTON_NEUTRAL)
         prev_btn.pack(side="left", padx=4)
         page_label.pack(side="left", padx=4)
-        next_btn = ctk.CTkButton(pager, text="Next", width=60, **BUTTON_NEUTRAL)
+        next_btn = ctk.CTkButton(pager, text="Next", width=72, height=34, **BUTTON_NEUTRAL)
         next_btn.pack(side="left", padx=4)
 
         body = ctk.CTkScrollableFrame(win, fg_color=colors["card_bg"], border_width=1, border_color=colors["border"])
@@ -2650,7 +3217,7 @@ class TeacherDeployUI:
 
         footer = ctk.CTkFrame(win, fg_color="transparent")
         footer.pack(fill="x", padx=12, pady=(0, 12))
-        ctk.CTkButton(footer, text="Close", command=win.destroy, width=90, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+        ctk.CTkButton(footer, text="Close", command=win.destroy, width=100, height=34, **BUTTON_NEUTRAL).pack(side="right", padx=4)
 
         def _pretty_day(day_key: str) -> str:
             try:
@@ -2766,8 +3333,8 @@ class TeacherDeployUI:
             pages[0].save(out_file, "PDF", resolution=100.0, save_all=True, append_images=pages[1:])
             messagebox.showinfo("Export", f"Exported {len(rows)} row(s) to: {out_file}")
 
-        ctk.CTkButton(footer, text="Export CSV", command=export_csv, width=110, **BUTTON_NEUTRAL).pack(side="right", padx=4)
-        ctk.CTkButton(footer, text="Export PDF", command=export_pdf, width=110, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+        ctk.CTkButton(footer, text="Export CSV", command=export_csv, width=116, height=34, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+        ctk.CTkButton(footer, text="Export PDF", command=export_pdf, width=116, height=34, **BUTTON_NEUTRAL).pack(side="right", padx=4)
 
         columns = ["Login Time", "Logout Time", "Full Name", "Student Number", "Year/Section", "Status", "Recording"]
         if include_pc:
@@ -2782,6 +3349,16 @@ class TeacherDeployUI:
             "Year/Section": "w",
             "Status": "w",
             "Recording": "w",
+        }
+        column_weights = {
+            "PC": 1,
+            "Login Time": 2,
+            "Logout Time": 2,
+            "Full Name": 2,
+            "Student Number": 1,
+            "Year/Section": 1,
+            "Status": 1,
+            "Recording": 2,
         }
 
         def apply_filters() -> None:
@@ -2810,13 +3387,35 @@ class TeacherDeployUI:
             nonlocal current_page
             for child in body.winfo_children():
                 child.destroy()
+            header_row = ctk.CTkFrame(body, fg_color="transparent")
+            header_row.pack(fill="x", padx=8, pady=(8, 4))
             for idx, col in enumerate(columns):
                 sticky = col_alignments.get(col, "w")
-                ctk.CTkLabel(body, text=col, font=(self.FONT_FAMILY, 12, "bold"), text_color=colors["text_primary"]).grid(row=0, column=idx, padx=10, pady=(8, 6), sticky=sticky)
+                ctk.CTkLabel(
+                    header_row,
+                    text=col,
+                    font=(self.FONT_FAMILY, 12, "bold"),
+                    text_color=colors["text_primary"],
+                ).grid(row=0, column=idx, padx=10, pady=(4, 6), sticky=sticky)
+                header_row.grid_columnconfigure(idx, weight=column_weights.get(col, 1), uniform="history_cols")
 
             if not filtered_records:
                 title_var.set(title)
-                ctk.CTkLabel(body, text="No session records found.", font=(self.FONT_FAMILY, 12), text_color=colors["text_secondary"]).grid(row=1, column=0, padx=12, pady=14, sticky="w")
+                summary_var.set("No matching session records. Adjust the filters or use YYYY-MM-DD for the date field.")
+                empty_state = ctk.CTkFrame(body, fg_color=colors["root_bg"], corner_radius=8, border_width=1, border_color=colors["border"])
+                empty_state.pack(fill="x", padx=8, pady=(6, 8))
+                ctk.CTkLabel(
+                    empty_state,
+                    text="No session records found.",
+                    font=(self.FONT_FAMILY, 12, "bold"),
+                    text_color=colors["text_primary"],
+                ).pack(anchor="w", padx=12, pady=(12, 2))
+                ctk.CTkLabel(
+                    empty_state,
+                    text="Try a different student name, section, or date filter.",
+                    font=(self.FONT_FAMILY, 11),
+                    text_color=colors["text_secondary"],
+                ).pack(anchor="w", padx=12, pady=(0, 12))
                 page_label.configure(text="Page 1/1")
                 prev_btn.configure(state="disabled")
                 next_btn.configure(state="disabled")
@@ -2828,13 +3427,29 @@ class TeacherDeployUI:
             active_day = day_keys[current_page] if day_keys else ""
             page_rows = list(grouped_by_day.get(active_day, []))
             title_var.set(f"{title} - {_pretty_day(active_day)}" if active_day else title)
+            summary_var.set(
+                f"{len(filtered_records)} matching record(s) across {total_pages} day(s). "
+                f"Showing {len(page_rows)} row(s) for {_pretty_day(active_day) if active_day else 'the selected range'}."
+            )
             page_label.configure(text=f"Page {current_page + 1}/{total_pages}")
             prev_btn.configure(state="normal" if current_page > 0 else "disabled")
             next_btn.configure(state="normal" if current_page + 1 < total_pages else "disabled")
 
             current_visible_rows.clear()
             current_visible_rows.extend(page_rows)
-            for row_idx, row in enumerate(page_rows, start=1):
+            for row in page_rows:
+                row_card = ctk.CTkFrame(
+                    body,
+                    fg_color=colors["root_bg"],
+                    corner_radius=8,
+                    border_width=1,
+                    border_color=colors["border"],
+                )
+                row_card.pack(fill="x", padx=8, pady=4)
+                for idx, col in enumerate(columns):
+                    row_card.grid_columnconfigure(idx, weight=column_weights.get(col, 1), uniform="history_cols")
+
+                rec_path = str(row.get("recording_path", "") or "")
                 values = [
                     self._format_ts(row.get("login_ts")),
                     self._format_ts(row.get("logout_ts")),
@@ -2842,20 +3457,21 @@ class TeacherDeployUI:
                     str(row.get("student_number", "")),
                     str(row.get("year_section", "")),
                     str(row.get("status", "")),
-                    str(Path(row.get("recording_path", "")).name) if row.get("recording_path") else "--",
+                    str(Path(rec_path).name) if rec_path else "--",
                 ]
                 value_columns = ["Login Time", "Logout Time", "Full Name", "Student Number", "Year/Section", "Status", "Recording"]
                 col_offset = 0
                 if include_pc:
                     pc = str(row.get("pc_id", ""))
                     pc_btn = ctk.CTkButton(
-                        body,
+                        row_card,
                         text=pc,
-                        width=80,
+                        width=84,
+                        height=30,
                         command=lambda pid=pc, w=win: (setattr(self, "selected_pc", pid), self.selected_history_button.configure(state="normal"), self._open_selected_history(), w.destroy()),
                         **BUTTON_NEUTRAL,
                     )
-                    pc_btn.grid(row=row_idx, column=0, padx=8, pady=4, sticky="w")
+                    pc_btn.grid(row=0, column=0, padx=10, pady=8, sticky="w")
                     col_offset = 1
                 for col_idx, val in enumerate(values):
                     col_name = value_columns[col_idx]
@@ -2863,10 +3479,32 @@ class TeacherDeployUI:
                     text_color = colors["text_secondary"]
                     if col_name == "Status":
                         text_color = self.STATUS_COLORS.get(val, colors["text_secondary"])
-                    ctk.CTkLabel(body, text=val, font=(self.FONT_FAMILY, 12), text_color=text_color).grid(row=row_idx, column=col_idx + col_offset, padx=10, pady=4, sticky=sticky)
-                rec_path = str(row.get("recording_path", "") or "")
-                if rec_path:
-                    ctk.CTkButton(body, text="Play", width=60, command=lambda p=rec_path: self._play_recording(p), **BUTTON_NEUTRAL).grid(row=row_idx, column=len(columns), padx=6, pady=4, sticky="w")
+                    target_column = col_idx + col_offset
+                    if col_name == "Recording" and rec_path:
+                        recording_cell = ctk.CTkFrame(row_card, fg_color="transparent")
+                        recording_cell.grid(row=0, column=target_column, padx=10, pady=8, sticky="ew")
+                        ctk.CTkLabel(
+                            recording_cell,
+                            text=val,
+                            font=(self.FONT_FAMILY, 12),
+                            text_color=colors["text_secondary"],
+                            anchor="w",
+                        ).pack(side="left", padx=(0, 8))
+                        ctk.CTkButton(
+                            recording_cell,
+                            text="Play",
+                            width=64,
+                            height=30,
+                            command=lambda p=rec_path: self._play_recording(p),
+                            **BUTTON_NEUTRAL,
+                        ).pack(side="right")
+                    else:
+                        ctk.CTkLabel(
+                            row_card,
+                            text=val,
+                            font=(self.FONT_FAMILY, 12),
+                            text_color=text_color,
+                        ).grid(row=0, column=target_column, padx=10, pady=8, sticky=sticky)
 
         def prev_page() -> None:
             nonlocal current_page
@@ -2883,9 +3521,13 @@ class TeacherDeployUI:
 
         prev_btn.configure(command=prev_page)
         next_btn.configure(command=next_page)
-        ctk.CTkButton(filter_bar, text="Apply", command=apply_filters, width=80, **BUTTON_PRIMARY).pack(side="left", padx=8)
-        ctk.CTkButton(filter_bar, text="Reset", command=lambda: (search_var.set(""), section_var.set(""), date_var.set(""), apply_filters()), width=80, **BUTTON_NEUTRAL).pack(side="left", padx=4)
+        search_entry.bind("<Return>", lambda _e: apply_filters())
+        section_entry.bind("<Return>", lambda _e: apply_filters())
+        date_entry.bind("<Return>", lambda _e: apply_filters())
+        ctk.CTkButton(filter_bar, text="Apply", command=apply_filters, width=88, height=34, **BUTTON_PRIMARY).pack(side="left", padx=8)
+        ctk.CTkButton(filter_bar, text="Reset", command=lambda: (search_var.set(""), section_var.set(""), date_var.set(""), apply_filters()), width=88, height=34, **BUTTON_NEUTRAL).pack(side="left", padx=4)
         apply_filters()
+        search_entry.focus_set()
     def _open_overall_history(self) -> None:
         records = self.server.get_all_sessions(limit=2000)
         summary: dict[str, dict] = {}
@@ -3010,6 +3652,9 @@ class TeacherDeployUI:
         win.title("Settings")
         win.geometry("760x620")
         win.transient(self.root)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
         win.bind("<Escape>", lambda _e: win.destroy())
         colors = self._apply_theme_to_toplevel(win)
 
@@ -3032,58 +3677,211 @@ class TeacherDeployUI:
         maxgb_var = ctk.StringVar(value=str(st.recording_max_gb))
         sess_var = ctk.StringVar(value=str(st.session_duration_s))
         day_var = ctk.StringVar(value=str(st.daily_limit_s))
-        msg_var = ctk.StringVar(value="1" if st.enable_session_messaging else "0")
-        ext_var = ctk.StringVar(value="1" if st.enable_extension_requests else "0")
         warn_var = ctk.StringVar(value="1" if st.enable_timer_near_limit_notify else "0")
         pause_var = ctk.StringVar(value="1" if st.enable_timer_pause_on_temp_lock else "0")
 
+        def add_tab_note(parent, text: str) -> None:
+            ctk.CTkLabel(
+                parent,
+                text=text,
+                font=(self.FONT_FAMILY, 11),
+                text_color=colors["text_secondary"],
+                justify="left",
+                wraplength=680,
+            ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        def _human_duration_text(total_s: int) -> str:
+            total = max(0, int(total_s))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            seconds = total % 60
+            parts: list[str] = []
+            if hours:
+                parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+            if minutes:
+                parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+            if seconds or not parts:
+                parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+            return ", ".join(parts)
+
+        def _seconds_equivalent_hint(raw: str, fallback: str) -> str:
+            try:
+                total = max(0, int(raw))
+            except ValueError:
+                return fallback
+            return f"Current value: {total} seconds = {_human_duration_text(total)}."
+
+        def _retention_days_hint(raw: str) -> str:
+            try:
+                days = max(1, int(raw))
+            except ValueError:
+                return "Example: 7 keeps recordings for about one week."
+            return f"Current value: keep recordings for about {days} day(s)."
+
+        def _recording_max_hint(raw: str) -> str:
+            try:
+                limit = max(0.1, float(raw))
+            except ValueError:
+                return "Example: 5.0 means the folder is trimmed after about 5 GB."
+            return f"Current value: keep total recordings under about {limit:.1f} GB."
+
+        add_tab_note(
+            stream_tab,
+            "Streaming controls the live video quality. Higher main quality looks sharper, while lower preview quality keeps the dashboard lighter.",
+        )
         ctk.CTkLabel(stream_tab, text="Main Stream Quality", text_color=colors["text_primary"]).pack(anchor="w", padx=12, pady=(10, 4))
         mrow = ctk.CTkFrame(stream_tab, fg_color="transparent")
         mrow.pack(fill="x", padx=12)
         for v in ("360p", "720p", "1080p"):
             ctk.CTkRadioButton(mrow, text=v, variable=main_var, value=v).pack(side="left", padx=8)
+        ctk.CTkLabel(
+            stream_tab,
+            text="Used for the selected live view and recording quality sent to student clients.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+        ).pack(anchor="w", padx=20, pady=(2, 8))
 
         ctk.CTkLabel(stream_tab, text="Preview Quality", text_color=colors["text_primary"]).pack(anchor="w", padx=12, pady=(14, 4))
         prow = ctk.CTkFrame(stream_tab, fg_color="transparent")
         prow.pack(fill="x", padx=12)
         for v in ("240p", "360p", "720p"):
             ctk.CTkRadioButton(prow, text=v, variable=prev_var, value=v).pack(side="left", padx=8)
+        ctk.CTkLabel(
+            stream_tab,
+            text="Used only for the small workstation previews on the admin dashboard.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+        ).pack(anchor="w", padx=20, pady=(2, 8))
 
         numeric_entries: dict[str, ctk.CTkEntry] = {}
         error_labels: dict[str, ctk.CTkLabel] = {}
 
-        def add_numeric_field(parent, key: str, label: str, var: ctk.StringVar) -> None:
+        def add_numeric_field(
+            parent,
+            key: str,
+            label: str,
+            var: ctk.StringVar,
+            help_text: str = "",
+            live_hint=None,
+        ) -> None:
             row = ctk.CTkFrame(parent, fg_color="transparent")
             row.pack(fill="x", padx=12, pady=(10, 2))
             ctk.CTkLabel(row, text=label, width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
-            entry = ctk.CTkEntry(row, textvariable=var)
+            entry = ctk.CTkEntry(row, textvariable=var, height=34)
             entry.pack(side="left", fill="x", expand=True)
+            if help_text:
+                ctk.CTkLabel(
+                    parent,
+                    text=help_text,
+                    font=(self.FONT_FAMILY, 11),
+                    text_color=colors["text_secondary"],
+                    justify="left",
+                    wraplength=500,
+                ).pack(anchor="w", padx=(216, 12), pady=(0, 2))
+            if live_hint is not None:
+                hint_label = ctk.CTkLabel(
+                    parent,
+                    text=live_hint(var.get()),
+                    font=(self.FONT_FAMILY, 11),
+                    text_color=colors["text_secondary"],
+                    justify="left",
+                    wraplength=500,
+                )
+                hint_label.pack(anchor="w", padx=(216, 12), pady=(0, 2))
+
+                def _refresh_hint(*_args) -> None:
+                    hint_label.configure(text=live_hint(var.get()))
+
+                var.trace_add("write", _refresh_hint)
             err_label = ctk.CTkLabel(parent, text="", font=(self.FONT_FAMILY, 11), text_color=ESSU_ERROR)
-            err_label.pack(anchor="w", padx=(216, 0), pady=(0, 4))
+            err_label.pack(anchor="w", padx=(216, 0), pady=(0, 6))
             numeric_entries[key] = entry
             error_labels[key] = err_label
 
-        add_numeric_field(runtime_tab, "reconnect_interval_s", "Reconnect Interval (s)", reci_var)
-        add_numeric_field(runtime_tab, "heartbeat_timeout_s", "Heartbeat Timeout (s)", hb_var)
+        add_tab_note(
+            runtime_tab,
+            "Runtime settings control reconnect timing and client health checks. All time values in this tab are measured in seconds.",
+        )
+        add_numeric_field(
+            runtime_tab,
+            "reconnect_interval_s",
+            "Reconnect Interval (s)",
+            reci_var,
+            help_text="How long a student waits before trying to reconnect again when the teacher server is unavailable.",
+            live_hint=lambda raw: _seconds_equivalent_hint(raw, "Example: 3 means retry every 3 seconds."),
+        )
+        add_numeric_field(
+            runtime_tab,
+            "heartbeat_timeout_s",
+            "Heartbeat Timeout (s)",
+            hb_var,
+            help_text="How long the admin waits without a heartbeat before marking a workstation offline.",
+            live_hint=lambda raw: _seconds_equivalent_hint(raw, "Example: 15 means mark the PC offline after 15 seconds with no heartbeat."),
+        )
 
         row = ctk.CTkFrame(runtime_tab, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=10)
         ctk.CTkLabel(row, text="Frame Queue Policy", width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
-        ctk.CTkOptionMenu(row, variable=q_var, values=["freshest", "drop_newest"]).pack(side="left", fill="x", expand=True)
+        q_menu = ctk.CTkOptionMenu(row, variable=q_var, values=["freshest", "drop_newest"], height=34)
+        q_menu.pack(side="left", fill="x", expand=True)
+        queue_note = ctk.CTkLabel(runtime_tab, font=(self.FONT_FAMILY, 11), text_color=colors["text_secondary"], justify="left", wraplength=500)
+        queue_note.pack(anchor="w", padx=(216, 12), pady=(0, 6))
 
+        def _refresh_queue_note(*_args) -> None:
+            if q_var.get() == "drop_newest":
+                queue_note.configure(text="drop_newest ignores new incoming preview frames when the queue is full.")
+            else:
+                queue_note.configure(text="freshest keeps the latest preview frame by dropping older queued frames when busy.")
+
+        q_var.trace_add("write", _refresh_queue_note)
+        _refresh_queue_note()
+
+        add_tab_note(
+            recording_tab,
+            "Recording settings control automatic capture and cleanup of saved videos on the teacher machine.",
+        )
         row = ctk.CTkFrame(recording_tab, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=10)
         ctk.CTkLabel(row, text="Recording Mode", width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
-        ctk.CTkOptionMenu(row, variable=rec_var, values=["off", "manual", "auto"]).pack(side="left", fill="x", expand=True)
+        rec_menu = ctk.CTkOptionMenu(row, variable=rec_var, values=["off", "manual", "auto"], height=34)
+        rec_menu.pack(side="left", fill="x", expand=True)
+        rec_note = ctk.CTkLabel(recording_tab, font=(self.FONT_FAMILY, 11), text_color=colors["text_secondary"], justify="left", wraplength=500)
+        rec_note.pack(anchor="w", padx=(216, 12), pady=(0, 6))
 
-        add_numeric_field(recording_tab, "recording_retention_days", "Recording Retention (days)", ret_var)
-        add_numeric_field(recording_tab, "recording_max_gb", "Recording Max (GB)", maxgb_var)
+        def _refresh_recording_mode_note(*_args) -> None:
+            mode = rec_var.get()
+            if mode == "manual":
+                rec_note.configure(text="manual enables the Start Recording and Stop Recording buttons for selected workstations.")
+            elif mode == "auto":
+                rec_note.configure(text="auto starts recording automatically when a student session begins.")
+            else:
+                rec_note.configure(text="off disables automatic recording and manual start/stop actions.")
+
+        rec_var.trace_add("write", _refresh_recording_mode_note)
+        _refresh_recording_mode_note()
+
+        add_numeric_field(
+            recording_tab,
+            "recording_retention_days",
+            "Recording Retention (days)",
+            ret_var,
+            help_text="Recordings older than this many days are deleted automatically.",
+            live_hint=_retention_days_hint,
+        )
+        add_numeric_field(
+            recording_tab,
+            "recording_max_gb",
+            "Recording Max (GB)",
+            maxgb_var,
+            help_text="When the recordings folder grows past this size, the oldest files are removed first.",
+            live_hint=_recording_max_hint,
+        )
 
         rec_actions = ctk.CTkFrame(recording_tab, fg_color="transparent")
         rec_actions.pack(fill="x", padx=12, pady=(10, 6))
-        manual_start_btn = ctk.CTkButton(rec_actions, text="Start Recording", command=self._manual_record_start, width=150, **BUTTON_PRIMARY)
+        manual_start_btn = ctk.CTkButton(rec_actions, text="Start Recording", command=self._manual_record_start, width=150, height=34, **BUTTON_PRIMARY)
         manual_start_btn.pack(side="left", padx=(0, 6))
-        manual_stop_btn = ctk.CTkButton(rec_actions, text="Stop Recording", command=self._manual_record_stop, width=150, **BUTTON_NEUTRAL)
+        manual_stop_btn = ctk.CTkButton(rec_actions, text="Stop Recording", command=self._manual_record_stop, width=150, height=34, **BUTTON_NEUTRAL)
         manual_stop_btn.pack(side="left", padx=(0, 6))
 
         def _refresh_manual_record_buttons(*_args) -> None:
@@ -3102,17 +3900,61 @@ class TeacherDeployUI:
         rec_var.trace_add("write", _refresh_manual_record_buttons)
         _refresh_manual_record_buttons()
 
+        add_tab_note(
+            appearance_tab,
+            "Appearance changes how the admin dashboard looks. `System` follows the current operating system theme.",
+        )
         arow = ctk.CTkFrame(appearance_tab, fg_color="transparent")
         arow.pack(fill="x", padx=12, pady=12)
         ctk.CTkLabel(arow, text="Theme", width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
-        ctk.CTkOptionMenu(arow, variable=theme_var, values=["light", "dark", "system"]).pack(side="left", fill="x", expand=True)
+        ctk.CTkOptionMenu(arow, variable=theme_var, values=["light", "dark", "system"], height=34).pack(side="left", fill="x", expand=True)
 
-        add_numeric_field(session_tab, "session_duration_s", "Session Duration (s)", sess_var)
-        add_numeric_field(session_tab, "daily_limit_s", "Daily Limit (s)", day_var)
-        ctk.CTkCheckBox(session_tab, text="Enable Session Messaging", variable=msg_var, onvalue="1", offvalue="0").pack(anchor="w", padx=12, pady=(8, 2))
-        ctk.CTkCheckBox(session_tab, text="Enable Extension Requests", variable=ext_var, onvalue="1", offvalue="0").pack(anchor="w", padx=12, pady=(2, 2))
+        add_tab_note(
+            session_tab,
+            "Session limits are stored in seconds. Examples: 3600 = 1 hour, 5400 = 1 hour 30 minutes, 7200 = 2 hours.",
+        )
+        ctk.CTkLabel(
+            session_tab,
+            text="Student messaging and extension requests are core features and stay enabled automatically.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+            justify="left",
+            wraplength=680,
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+        add_numeric_field(
+            session_tab,
+            "session_duration_s",
+            "Session Duration (s)",
+            sess_var,
+            help_text="Maximum time allowed for one login session before the student must sign in again.",
+            live_hint=lambda raw: _seconds_equivalent_hint(raw, "Enter the session duration in seconds. Example: 7200 = 2 hours."),
+        )
+        add_numeric_field(
+            session_tab,
+            "daily_limit_s",
+            "Daily Limit (s)",
+            day_var,
+            help_text="Total time a student can use the system in one day across all sessions.",
+            live_hint=lambda raw: _seconds_equivalent_hint(raw, "Enter the daily limit in seconds. Example: 7200 = 2 hours."),
+        )
         ctk.CTkCheckBox(session_tab, text="Enable Near-Limit Timer Notification", variable=warn_var, onvalue="1", offvalue="0").pack(anchor="w", padx=12, pady=(2, 2))
-        ctk.CTkCheckBox(session_tab, text="Pause Timer on Temporary Lock", variable=pause_var, onvalue="1", offvalue="0").pack(anchor="w", padx=12, pady=(2, 8))
+        ctk.CTkLabel(
+            session_tab,
+            text="Enables near-limit timer warning events for supported student clients when time is almost over.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+            justify="left",
+            wraplength=680,
+        ).pack(anchor="w", padx=(36, 12), pady=(0, 4))
+        ctk.CTkCheckBox(session_tab, text="Pause Timer on Temporary Lock", variable=pause_var, onvalue="1", offvalue="0").pack(anchor="w", padx=12, pady=(2, 2))
+        ctk.CTkLabel(
+            session_tab,
+            text="Pauses the session countdown during a temporary lock and resumes it after unlock.",
+            font=(self.FONT_FAMILY, 11),
+            text_color=colors["text_secondary"],
+            justify="left",
+            wraplength=680,
+        ).pack(anchor="w", padx=(36, 12), pady=(0, 8))
 
         actions = ctk.CTkFrame(win, fg_color="transparent")
         actions.pack(fill="x", padx=12, pady=(0, 12))
@@ -3155,8 +3997,8 @@ class TeacherDeployUI:
                 recording_max_gb=max(0.1, float(parsed["recording_max_gb"])),
                 session_duration_s=max(60, int(parsed["session_duration_s"])),
                 daily_limit_s=max(60, int(parsed["daily_limit_s"])),
-                enable_session_messaging=(msg_var.get() == "1"),
-                enable_extension_requests=(ext_var.get() == "1"),
+                enable_session_messaging=True,
+                enable_extension_requests=True,
                 enable_timer_near_limit_notify=(warn_var.get() == "1"),
                 enable_timer_pause_on_temp_lock=(pause_var.get() == "1"),
             )
@@ -3166,11 +4008,11 @@ class TeacherDeployUI:
             self._apply_theme_to_ui()
             win.destroy()
 
-        ctk.CTkButton(actions, text="Overall Session History", command=self._open_overall_history, **BUTTON_NEUTRAL).pack(side="left", padx=4)
+        ctk.CTkButton(actions, text="Overall Session History", command=self._open_overall_history, height=34, **BUTTON_NEUTRAL).pack(side="left", padx=4)
         # ctk.CTkButton(actions, text="Students", command=self._open_student_management, **BUTTON_NEUTRAL).pack(side="left", padx=4)
         # ctk.CTkButton(actions, text="Reservations", command=self._open_reservation_management, **BUTTON_NEUTRAL).pack(side="left", padx=4)
-        ctk.CTkButton(actions, text="Close", command=win.destroy, **BUTTON_NEUTRAL).pack(side="right", padx=4)
-        ctk.CTkButton(actions, text="Save", command=save_settings, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+        ctk.CTkButton(actions, text="Close", command=win.destroy, height=34, **BUTTON_NEUTRAL).pack(side="right", padx=4)
+        ctk.CTkButton(actions, text="Save Settings", command=save_settings, height=34, **BUTTON_PRIMARY).pack(side="right", padx=4)
 
     def _open_student_management(self) -> None:
         self.student_management_panel.open()
@@ -3286,12 +4128,13 @@ class TeacherDeployUI:
             thumb = thumb.resize((640, 360)).resize((460, 300))
         elif self.server.settings.preview_stream_profile == "720p":
             thumb = thumb.resize((1280, 720)).resize((460, 300))
+        status, color = self._status_for_pc(pc_id)
+        thumb = self._apply_preview_status_dot(thumb, color)
         photo = ImageTk.PhotoImage(thumb)
         preview = self.tiles[pc_id]["preview"]
         tile = self.tiles[pc_id]["tile"]
         assert isinstance(preview, ctk.CTkLabel)
         assert isinstance(tile, ctk.CTkFrame)
-        status, color = self._status_for_pc(pc_id)
         is_selected = self.selected_pc == pc_id
         self._configure_if_changed(
             tile,
@@ -3301,7 +4144,7 @@ class TeacherDeployUI:
         )
         indicator = self.tiles[pc_id]["indicator"]
         assert isinstance(indicator, ctk.CTkLabel)
-        self._configure_if_changed(indicator, text_color=color)
+        self._configure_if_changed(indicator, text="", fg_color="transparent", text_color=color)
         self._configure_if_changed(preview, text="", fg_color="transparent")
         preview.configure(image=photo)
         preview.image = photo
@@ -3313,9 +4156,9 @@ class TeacherDeployUI:
                 return
             self._last_large_repaint_ts[pc_id] = large_now_ts
             if online:
-                # get current label size
-                width = self.large_view.winfo_width()
-                height = self.large_view.winfo_height()
+                # Fit the image to the fixed preview host so it never reflows the dashboard layout.
+                width = self.large_view_host.winfo_width() if hasattr(self, "large_view_host") else self.large_view.winfo_width()
+                height = self.large_view_host.winfo_height() if hasattr(self, "large_view_host") else self.large_view.winfo_height()
 
                 if width > 1 and height > 1:
                     display_img = self._apply_main_overlay(base_image, pc_id)
@@ -3334,10 +4177,10 @@ class TeacherDeployUI:
                     self.large_view.image = large_photo
             else:
                 try:
-                    self._configure_if_changed(self.large_view, image=None, text="Selected PC Offline", text_color=self._theme_palette()["text_secondary"], fg_color="transparent")
+                    self._configure_if_changed(self.large_view, image=None, text="Selected workstation is offline.", text_color=self._theme_palette()["text_secondary"], fg_color="transparent")
                 except tk.TclError:
                     self._recreate_large_view()
-                    self._configure_if_changed(self.large_view, image=None, text="Selected PC Offline", text_color=self._theme_palette()["text_secondary"], fg_color="transparent")
+                    self._configure_if_changed(self.large_view, image=None, text="Selected workstation is offline.", text_color=self._theme_palette()["text_secondary"], fg_color="transparent")
                 self.large_view.image = None
             self._update_sensor_panel(pc_id)
 
@@ -3347,65 +4190,84 @@ class TeacherDeployUI:
         except Exception:
             pass
         colors = self._theme_palette()
-        self.large_view = ctk.CTkLabel(self.middle, text="No selection", anchor="center", fg_color="transparent", text_color=colors["text_secondary"], corner_radius=8)
-        self.large_view.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.large_view = ctk.CTkLabel(
+            self.large_view_host,
+            text="Select a workstation to view its live feed.",
+            anchor="center",
+            justify="center",
+            wraplength=520,
+            font=(self.FONT_FAMILY, 18, "bold"),
+            fg_color="transparent",
+            text_color=colors["text_secondary"],
+            corner_radius=8,
+        )
+        self.large_view.pack(fill="both", expand=True)
 
     def _drain_queues(self) -> None:
-        # Update changed thumbnails only
-        changed: set[str] = set(self._pending_pc_updates)
-        self._pending_pc_updates.clear()
-        latest_frames: dict[str, Image.Image] = {}
         try:
-            while True:
-                pc_id, image = self.server.frame_queue.get_nowait()
-                latest_frames[pc_id] = image
-                changed.add(pc_id)
-        except queue.Empty:
-            pass
-        if latest_frames:
-            with self.server.lock:
-                for pc_id, image in latest_frames.items():
-                    if pc_id in self.server.clients:
-                        self.server.clients[pc_id].last_frame = image
+            self._refresh_runtime_notice()
 
-        try:
-            while True:
-                changed.add(self.server.status_queue.get_nowait())
-        except queue.Empty:
-            pass
+            # Update changed thumbnails only
+            changed: set[str] = set(self._pending_pc_updates)
+            self._pending_pc_updates.clear()
+            latest_frames: dict[str, Image.Image] = {}
+            try:
+                while True:
+                    pc_id, image = self.server.frame_queue.get_nowait()
+                    latest_frames[pc_id] = image
+                    changed.add(pc_id)
+            except queue.Empty:
+                pass
+            if latest_frames:
+                with self.server.lock:
+                    for pc_id, image in latest_frames.items():
+                        if pc_id in self.server.clients:
+                            self.server.clients[pc_id].last_frame = image
 
-        try:
-            while True:
-                changed.add(self.server.sensor_queue.get_nowait())
-        except queue.Empty:
-            pass
+            try:
+                while True:
+                    changed.add(self.server.status_queue.get_nowait())
+            except queue.Empty:
+                pass
 
-        ordered_changed = sorted(changed)
-        if ordered_changed:
-            start_idx = self._drain_rr_index % len(ordered_changed)
-            rotated_changed = ordered_changed[start_idx:] + ordered_changed[:start_idx]
-            processed = 0
-            for idx, pc_id in enumerate(rotated_changed):
-                if idx >= self.MAX_TILE_UPDATES_PER_DRAIN:
-                    self._pending_pc_updates.update(rotated_changed[idx:])
-                    break
-                image = latest_frames.get(pc_id)
-                if image is None:
-                    with self.server.lock:
-                        image = self.server.clients[pc_id].last_frame if pc_id in self.server.clients else None
-                try:
-                    self._update_tile_frame(pc_id, image)
-                except tk.TclError:
-                    self._recreate_large_view()
-                processed += 1
-            self._drain_rr_index = (start_idx + processed) % len(ordered_changed)
+            try:
+                while True:
+                    changed.add(self.server.sensor_queue.get_nowait())
+            except queue.Empty:
+                pass
 
-        if self.selected_pc:
-            self._update_sensor_panel(self.selected_pc)
+            ordered_changed = sorted(changed)
+            if ordered_changed:
+                start_idx = self._drain_rr_index % len(ordered_changed)
+                rotated_changed = ordered_changed[start_idx:] + ordered_changed[:start_idx]
+                processed = 0
+                for idx, pc_id in enumerate(rotated_changed):
+                    if idx >= self.MAX_TILE_UPDATES_PER_DRAIN:
+                        self._pending_pc_updates.update(rotated_changed[idx:])
+                        break
+                    image = latest_frames.get(pc_id)
+                    if image is None:
+                        with self.server.lock:
+                            image = self.server.clients[pc_id].last_frame if pc_id in self.server.clients else None
+                    try:
+                        self._update_tile_frame(pc_id, image)
+                    except tk.TclError:
+                        self._recreate_large_view()
+                    processed += 1
+                self._drain_rr_index = (start_idx + processed) % len(ordered_changed)
 
-        self._refresh_control_buttons()
+            if self.selected_pc:
+                self._update_sensor_panel(self.selected_pc)
 
-        self.root.after(100, self._drain_queues)
+            self._refresh_control_buttons()
+        except Exception as exc:
+            self.server._log_event("ui_drain_error", reason=str(exc))
+            self._set_runtime_notice("Dashboard recovered after a refresh issue.", ESSU_WARNING, hold_s=20.0)
+        finally:
+            try:
+                self.root.after(100, self._drain_queues)
+            except tk.TclError:
+                pass
 
     def run(self) -> None:
         self.root.mainloop()

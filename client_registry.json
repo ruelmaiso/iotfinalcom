@@ -1,25 +1,30 @@
 {
   "clients": [
     {
-      "mac": "e2:31:62:31:92:0b",
+      "mac": "e8:65:38:0c:fd:44",
       "hostname": "matilde",
       "pc_id": "PC01"
     },
     {
-      "mac": "d0:57:66:e8:3f:2d",
-      "hostname": "matilde",
+      "mac": "e6:13:0d:57:c0:74",
+      "hostname": "JOVSSEL",
       "pc_id": "PC02"
     },
     {
-      "mac": "ca:77:90:c7:3a:40",
+      "mac": "f4:84:6d:ef:cb:33",
       "hostname": "matilde",
       "pc_id": "PC03"
     },
     {
-      "mac": "e8:65:38:0c:fd:44",
+      "mac": "a6:b6:47:30:a3:ab",
       "hostname": "matilde",
       "pc_id": "PC04"
+    },
+    {
+      "mac": "d0:c5:d3:a9:23:c2",
+      "hostname": "DESKTOP-S37OIV1",
+      "pc_id": "PC05"
     }
   ],
-  "next_id": 5
+  "next_id": 6
 }

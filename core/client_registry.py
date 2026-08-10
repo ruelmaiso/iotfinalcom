@@ -3,6 +3,12 @@ from pathlib import Path
 from typing import Any
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
 class ClientRegistry:
     def __init__(self, file_path: Path):
         self.file_path = file_path
@@ -27,7 +33,7 @@ class ClientRegistry:
             return fallback
 
     def _save(self, payload: dict[str, Any]) -> None:
-        self.file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _write_json_atomic(self.file_path, payload)
 
     def get_or_assign_id(self, mac: str, hostname: str) -> str:
         normalized_mac = mac.strip().lower()

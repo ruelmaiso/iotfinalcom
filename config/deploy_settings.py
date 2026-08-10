@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    teacher_host: str = "192.168.1.127"
+    teacher_host: str = "192.168.43.41" ##110.236
     control_port: int = 9201
     video_port: int = 9200
     sensor_port: int = 9202
@@ -64,3 +64,9 @@ RUNTIME = RuntimeConfig()
 
 # NETWORK = NetworkConfig()
 # RUNTIME = RuntimeConfig()
+
+
+# .\venv\Scripts\Activate.ps1   
+# py -m venv venv  
+# pip install -r requirements.txt     
+# python.exe -m pip install --upgrade pip    

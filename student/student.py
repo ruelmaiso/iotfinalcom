@@ -4,6 +4,7 @@ import random
 import socket
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from enum import Enum
@@ -15,8 +16,13 @@ import customtkinter as ctk
 import mss
 import numpy
 import os
+import platform
 import psutil
-from PIL import Image
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+from PIL import Image, ImageTk
 import sys
 
 # ---- PyInstaller-safe resource path ----
@@ -31,7 +37,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config.deploy_settings import NETWORK, RUNTIME
-from core.protocol import recv_json_line, send_frame, send_json
+from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_DTYPE = "int16"
+AUDIO_BLOCK_MS = 40
+AUDIO_BLOCK_SIZE = max(1, int(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_MS / 1000))
 
 
 DEV_MODE = True
@@ -41,6 +53,8 @@ class OverlayState(Enum):
     HIDDEN = "hidden"
     AUTH_REQUIRED = "auth_required"
     LOCKED_TEMPORARY = "locked_temporary"
+    CONNECTING = "connecting"
+    BROADCAST = "broadcast"
 
 
 class OverlayController:
@@ -49,9 +63,15 @@ class OverlayController:
         self._root: Optional[ctk.CTk] = None
         self._lock_frame: Optional[ctk.CTkFrame] = None
         self._auth_frame: Optional[ctk.CTkFrame] = None
+        self._connecting_frame: Optional[ctk.CTkFrame] = None
+        self._broadcast_frame: Optional[ctk.CTkFrame] = None
+        self._broadcast_image_label: Optional[ctk.CTkLabel] = None
+        self._broadcast_status_label: Optional[ctk.CTkLabel] = None
+        self._broadcast_photo: Optional[ImageTk.PhotoImage] = None
         self._state = OverlayState.HIDDEN
         self._cmd_q: "queue.Queue[tuple[str, dict, threading.Event, dict]]" = queue.Queue()
         self._worker_started = False
+        self._worker_thread: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
         self._auth_result_q: "queue.Queue[Optional[dict]]" = queue.Queue()
         self._auth_handlers: Optional[tuple] = None
@@ -71,6 +91,9 @@ class OverlayController:
         self._chat_launcher_button: Optional[ctk.CTkButton] = None
         self._chat_timer_provider: Optional[Callable[[], Optional[int]]] = None
         self._chat_timer_after_id = None
+        self._chat_launcher_pos: Optional[tuple[int, int]] = None
+        self._chat_launcher_drag_state: Optional[dict] = None
+        self._chat_launcher_suppress_click_until = 0.0
 
         logo_path = resource_path("assets/essu_logo.png")
         try:
@@ -82,12 +105,127 @@ class OverlayController:
 
     def _ensure_worker(self) -> None:
         with self._worker_lock:
-            if self._worker_started:
+            if self._worker_thread is not None and self._worker_thread.is_alive():
                 return
             self._worker_started = True
-            threading.Thread(target=self._ui_loop, daemon=True).start()
+            self._ui_ready_event.clear()
+            self._worker_thread = threading.Thread(target=self._ui_loop, daemon=True)
+            self._worker_thread.start()
 
- 
+    def _build_connecting_frame(self) -> ctk.CTkFrame:
+        assert self._root is not None
+
+        frame = ctk.CTkFrame(self._root, fg_color="#0F172A")
+        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        card = ctk.CTkFrame(
+            frame,
+            width=560,
+            fg_color="#1E293B",
+            corner_radius=20,
+            border_width=1,
+            border_color="#334155",
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(
+            card,
+            text="Connecting to Teacher Server",
+            font=("Arial", 28, "bold"),
+            text_color="#F8FAFC",
+        ).pack(pady=(36, 12), padx=32)
+
+        ctk.CTkLabel(
+            card,
+            text="This workstation will continue automatically when the server becomes available.",
+            font=("Arial", 14),
+            text_color="#94A3B8",
+            justify="center",
+            wraplength=430,
+        ).pack(pady=(0, 10), padx=32)
+
+        ctk.CTkLabel(
+            card,
+            text="Retrying connection in the background.",
+            font=("Arial", 13, "bold"),
+            text_color="#60A5FA",
+        ).pack(pady=(0, 34))
+
+        return frame
+
+    def _build_broadcast_frame(self) -> ctk.CTkFrame:
+        assert self._root is not None
+        frame = ctk.CTkFrame(self._root, fg_color="#020617")
+        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        self._broadcast_image_label = ctk.CTkLabel(
+            frame,
+            text="Teacher screen broadcast is starting...",
+            text_color="#E2E8F0",
+            font=("Arial", 24, "bold"),
+            fg_color="transparent",
+            anchor="center",
+            justify="center",
+        )
+        self._broadcast_image_label.pack(fill="both", expand=True, padx=18, pady=(18, 8))
+
+        self._broadcast_status_label = ctk.CTkLabel(
+            frame,
+            text="Live teacher broadcast",
+            text_color="#94A3B8",
+            font=("Arial", 13),
+            fg_color="transparent",
+        )
+        self._broadcast_status_label.pack(pady=(0, 18))
+        return frame
+
+    def _clear_broadcast_ui(self) -> None:
+        if self._broadcast_image_label is not None and self._broadcast_image_label.winfo_exists():
+            self._broadcast_image_label.configure(
+                image=None,
+                text="Teacher screen broadcast is starting...",
+                compound="center",
+            )
+            self._broadcast_image_label.image = None
+        self._broadcast_photo = None
+
+    def _hide_broadcast(self) -> None:
+        if self._broadcast_frame is not None and self._broadcast_frame.winfo_exists():
+            self._broadcast_frame.place_forget()
+
+    def _show_broadcast(self) -> None:
+        assert self._root is not None
+        if self._auth_frame is not None and self._auth_frame.winfo_exists():
+            self._auth_frame.place_forget()
+        if self._lock_frame is not None and self._lock_frame.winfo_exists():
+            self._lock_frame.place_forget()
+        if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
+            self._connecting_frame.place_forget()
+        if self._broadcast_frame is None or not self._broadcast_frame.winfo_exists():
+            self._broadcast_frame = self._build_broadcast_frame()
+        else:
+            self._broadcast_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._broadcast_frame.lift()
+
+    def _render_broadcast_frame(self, image: Optional[Image.Image]) -> None:
+        assert self._root is not None
+        if image is None:
+            self._clear_broadcast_ui()
+            return
+        if self._broadcast_frame is None or not self._broadcast_frame.winfo_exists():
+            self._broadcast_frame = self._build_broadcast_frame()
+        if self._broadcast_image_label is None or not self._broadcast_image_label.winfo_exists():
+            return
+        display = image.copy()
+        screen_w = max(1, int(self._root.winfo_screenwidth()))
+        screen_h = max(1, int(self._root.winfo_screenheight()))
+        display.thumbnail((screen_w, screen_h))
+        self._broadcast_photo = ImageTk.PhotoImage(display)
+        self._broadcast_image_label.configure(image=self._broadcast_photo, text="", compound="center")
+        self._broadcast_image_label.image = self._broadcast_photo
+        if self._broadcast_status_label is not None and self._broadcast_status_label.winfo_exists():
+            self._broadcast_status_label.configure(text="Live teacher broadcast")
+
     def _build_lock_frame(self) -> ctk.CTkFrame:
         assert self._root is not None
 
@@ -130,21 +268,40 @@ class OverlayController:
 
         if self._auth_frame is not None and self._auth_frame.winfo_exists():
             self._auth_frame.place_forget()
+        if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
+            self._connecting_frame.place_forget()
+        self._hide_broadcast()
 
         if self._lock_frame is None or not self._lock_frame.winfo_exists():
             self._lock_frame = self._build_lock_frame()
         else:
             self._lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # ensure chat launcher stays above lock overlay
         if self._chat_launcher is not None and self._chat_launcher.winfo_exists():
             self._chat_launcher.lift()
             self._chat_launcher.attributes("-topmost", True)
+
+    def _show_connecting(self) -> None:
+        assert self._root is not None
+
+        if self._auth_frame is not None and self._auth_frame.winfo_exists():
+            self._auth_frame.place_forget()
+        if self._lock_frame is not None and self._lock_frame.winfo_exists():
+            self._lock_frame.place_forget()
+        self._hide_broadcast()
+
+        if self._connecting_frame is None or not self._connecting_frame.winfo_exists():
+            self._connecting_frame = self._build_connecting_frame()
+        else:
+            self._connecting_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
     def _show_auth(self, send_login, send_register) -> None:
         assert self._root is not None
         if self._lock_frame is not None and self._lock_frame.winfo_exists():
             self._lock_frame.place_forget()
+        if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
+            self._connecting_frame.place_forget()
+        self._hide_broadcast()
         if self._auth_frame is not None and self._auth_frame.winfo_exists():
             self._auth_frame.destroy()
 
@@ -347,16 +504,57 @@ class OverlayController:
 
         self._chat_timer_after_id = self._root.after(1000, _tick)
 
+    def _chat_launcher_metrics(self) -> tuple[int, int, int, int]:
+        launcher = self._chat_launcher if self._chat_launcher is not None else self._root
+        assert launcher is not None
+        screen_w = int(launcher.winfo_screenwidth())
+        screen_h = int(launcher.winfo_screenheight())
+        width = max(100, min(164, int(screen_w * 0.09)))
+        height = 36
+        return screen_w, screen_h, width, height
+
+    def _clamp_chat_launcher_pos(self, x: int, y: int) -> tuple[int, int]:
+        screen_w, screen_h, width, height = self._chat_launcher_metrics()
+        max_x = max(0, screen_w - width)
+        max_y = max(0, screen_h - height)
+        return max(0, min(int(x), max_x)), max(0, min(int(y), max_y))
+
+    def _handle_chat_launcher_click(self) -> None:
+        if time.time() < float(self._chat_launcher_suppress_click_until):
+            return
+        self._open_chat_window()
+
+    def _raise_chat_launcher(self, force_restack: bool = False) -> None:
+        if self._chat_launcher is None or not self._chat_launcher.winfo_exists():
+            return
+        launcher = self._chat_launcher
+        try:
+            if force_restack:
+                launcher.attributes("-topmost", False)
+            launcher.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            if self._root is not None and self._root.winfo_exists():
+                launcher.lift(self._root)
+            else:
+                launcher.lift()
+        except Exception:
+            pass
+
     def _position_chat_launcher(self) -> None:
         if self._chat_launcher is None or not self._chat_launcher.winfo_exists():
             return
-        screen_w = int(self._chat_launcher.winfo_screenwidth())
-        screen_h = int(self._chat_launcher.winfo_screenheight())
-        width = max(100, min(180, int(screen_w * 0.10)))
-        height = 40
+        screen_w, screen_h, width, height = self._chat_launcher_metrics()
         top_margin = max(10, int(screen_h * 0.02))
-        x = max(0, (screen_w - width) // 2)
-        self._chat_launcher.geometry(f"{width}x{height}+{x}+{top_margin}")
+        if self._chat_launcher_pos is None:
+            x = max(0, (screen_w - width) // 2)
+            y = top_margin
+        else:
+            x, y = self._clamp_chat_launcher_pos(*self._chat_launcher_pos)
+            self._chat_launcher_pos = (x, y)
+        self._chat_launcher.geometry(f"{width}x{height}+{x}+{y}")
+        self._raise_chat_launcher()
 
     def _ensure_chat_launcher(self) -> None:
         assert self._root is not None
@@ -368,21 +566,64 @@ class OverlayController:
             launcher.attributes("-topmost", True)
         except Exception:
             pass
-        launcher.configure(fg_color="#0F172A")
-        shell = ctk.CTkFrame(launcher, fg_color="#0F172A", corner_radius=16, border_width=1, border_color="#334155")
-        shell.pack(fill="both", expand=True)
+        launcher.configure(fg_color="#2563EB")
+        # UI POLISH ONLY
         btn = ctk.CTkButton(
-            shell,
+            launcher,
             text="?? --:--:--",
             width=170,
-            height=40,
+            height=36,
             fg_color="#2563EB",
             hover_color="#1D4ED8",
             text_color="#F8FAFC",
-            font=("Arial", 13, "bold"),
-            command=self._open_chat_window,
+            font=("Arial", 12, "bold"),
+            corner_radius=12,
+            border_width=0,
+            command=self._handle_chat_launcher_click,
         )
-        btn.pack(fill="both", expand=True, padx=8, pady=8)
+        btn.pack(fill="both", expand=True, padx=0, pady=0)
+
+        def _on_press(event) -> None:
+            if launcher is None or not launcher.winfo_exists():
+                return
+            self._chat_launcher_drag_state = {
+                "press_x": int(event.x_root),
+                "press_y": int(event.y_root),
+                "start_x": int(launcher.winfo_x()),
+                "start_y": int(launcher.winfo_y()),
+                "dragging": False,
+            }
+            self._raise_chat_launcher(force_restack=True)
+
+        def _on_drag(event) -> None:
+            if not self._chat_enabled:
+                return
+            state = self._chat_launcher_drag_state
+            if not state or launcher is None or not launcher.winfo_exists():
+                return
+            dx = int(event.x_root) - int(state["press_x"])
+            dy = int(event.y_root) - int(state["press_y"])
+            if (not state["dragging"]) and max(abs(dx), abs(dy)) < 6:
+                return
+            state["dragging"] = True
+            new_x = int(state["start_x"]) + dx
+            new_y = int(state["start_y"]) + dy
+            new_x, new_y = self._clamp_chat_launcher_pos(new_x, new_y)
+            self._chat_launcher_pos = (new_x, new_y)
+            launcher.geometry(f"+{new_x}+{new_y}")
+            self._raise_chat_launcher()
+            self._chat_launcher_suppress_click_until = time.time() + 0.25
+
+        def _on_release(_event) -> None:
+            state = self._chat_launcher_drag_state
+            if state and state.get("dragging"):
+                self._chat_launcher_suppress_click_until = time.time() + 0.25
+            self._chat_launcher_drag_state = None
+            self._raise_chat_launcher(force_restack=True)
+
+        btn.bind("<ButtonPress-1>", _on_press, add="+")
+        btn.bind("<B1-Motion>", _on_drag, add="+")
+        btn.bind("<ButtonRelease-1>", _on_release, add="+")
         
         self._chat_launcher = launcher
         self._chat_launcher_button = btn
@@ -537,6 +778,9 @@ class OverlayController:
             self._auth_frame.place_forget()
         if self._lock_frame is not None and self._lock_frame.winfo_exists():
             self._lock_frame.place_forget()
+        if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
+            self._connecting_frame.place_forget()
+        self._hide_broadcast()
 
     def _apply_state(self, state: OverlayState, send_login=None, send_register=None) -> None:
         assert self._root is not None
@@ -559,6 +803,9 @@ class OverlayController:
         elif state == OverlayState.LOCKED_TEMPORARY:
             self._show_lock()
 
+        elif state == OverlayState.CONNECTING:
+            self._show_connecting()
+
         elif state == OverlayState.AUTH_REQUIRED:
             if send_login is not None and send_register is not None:
                 self._auth_handlers = (send_login, send_register)
@@ -573,6 +820,9 @@ class OverlayController:
 
                 send_login, send_register = _bootstrap_noop_login, _bootstrap_noop_register
             self._show_auth(send_login, send_register)
+
+        elif state == OverlayState.BROADCAST:
+            self._show_broadcast()
 
         # HIDDEN FIX + FULLSCREEN FIX
         self._root.deiconify()
@@ -628,6 +878,14 @@ class OverlayController:
 
         self._toast_after_id = self._root.after(max(500, int(duration_ms)), _hide_toast)
 
+    def _report_tk_callback_exception(self, exc, val, tb) -> None:
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        print(detail)
+        try:
+            self._show_toast("Overlay recovered after a UI issue.", duration_ms=5000)
+        except Exception:
+            pass
+
     def _apply_fullscreen_geometry(self) -> None:
         assert self._root is not None
         screen_w = max(1, int(self._root.winfo_screenwidth()))
@@ -639,81 +897,118 @@ class OverlayController:
             pass
 
     def _ui_loop(self) -> None:
-        self._root = ctk.CTk()
-        self._ui_ready_event.set()
+        try:
+            self._root = ctk.CTk()
+            self._root.report_callback_exception = self._report_tk_callback_exception
+            self._ui_ready_event.set()
 
-        self._root.title("Student Overlay")
-        self._root.protocol("WM_DELETE_WINDOW", lambda: None)
-        self._root.configure(fg_color="#0e1116")
-        self._apply_fullscreen_geometry()
-        self._root.bind("<Alt-F4>", lambda _e: "break")
-        if DEV_MODE:
-            def _dev_force_exit(_event=None):
-                if self._root is None:
-                    return
-                try:
-                    self._root.attributes("-fullscreen", False)
-                except Exception:
-                    pass
-                try:
-                    self._root.attributes("-topmost", False)
-                except Exception:
-                    pass
-                try:
-                    self._root.state("normal")
-                except Exception:
-                    pass
-                try:
-                    self._root.destroy()
-                except Exception:
-                    pass
-                os._exit(0)
+            self._root.title("Student Overlay")
+            self._root.protocol("WM_DELETE_WINDOW", lambda: None)
+            self._root.configure(fg_color="#0e1116")
+            self._apply_fullscreen_geometry()
+            self._root.bind("<Alt-F4>", lambda _e: "break")
+            if DEV_MODE:
+                def _dev_force_exit(_event=None):
+                    if self._root is None:
+                        return
+                    try:
+                        self._root.attributes("-fullscreen", False)
+                    except Exception:
+                        pass
+                    try:
+                        self._root.attributes("-topmost", False)
+                    except Exception:
+                        pass
+                    try:
+                        self._root.state("normal")
+                    except Exception:
+                        pass
+                    try:
+                        self._root.destroy()
+                    except Exception:
+                        pass
+                    os._exit(0)
 
-            self._root.bind_all("<Control-Shift-D>", _dev_force_exit)
+                self._root.bind_all("<Control-Shift-D>", _dev_force_exit)
 
-        def pump_commands() -> None:
-            while True:
+            def pump_commands() -> None:
                 try:
-                    cmd, payload, done, result = self._cmd_q.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    if cmd == "set_state":
-                        self._apply_state(payload["state"])
-                        result["ok"] = True
-                    elif cmd == "auth":
-                        while not self._auth_result_q.empty():
-                            try:
-                                self._auth_result_q.get_nowait()
-                            except queue.Empty:
-                                break
-                        self._apply_state(
-                            OverlayState.AUTH_REQUIRED,
-                            payload["send_login"],
-                            payload["send_register"],
-                        )
-                        result["ok"] = True
-                    elif cmd == "toast":
-                        self._show_toast(payload.get("text", ""), int(payload.get("duration_ms", 4500)))
-                        result["ok"] = True
-                    elif cmd == "chat_add":
-                        self._append_chat_history(str(payload.get("direction", "teacher_to_student")), payload.get("text", ""), payload.get("ts"))
-                        self._refresh_chat_window()
-                        result["ok"] = True
-                    elif cmd == "chat_visibility":
-                        self._set_chat_enabled_ui(bool(payload.get("enabled", False)))
-                        result["ok"] = True
-                    else:
-                        result["ok"] = False
+                    while True:
+                        try:
+                            cmd, payload, done, result = self._cmd_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if cmd == "set_state":
+                                self._apply_state(payload["state"])
+                                result["ok"] = True
+                            elif cmd == "auth":
+                                while not self._auth_result_q.empty():
+                                    try:
+                                        self._auth_result_q.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                self._apply_state(
+                                    OverlayState.AUTH_REQUIRED,
+                                    payload["send_login"],
+                                    payload["send_register"],
+                                )
+                                result["ok"] = True
+                            elif cmd == "toast":
+                                self._show_toast(payload.get("text", ""), int(payload.get("duration_ms", 4500)))
+                                result["ok"] = True
+                            elif cmd == "chat_add":
+                                self._append_chat_history(str(payload.get("direction", "teacher_to_student")), payload.get("text", ""), payload.get("ts"))
+                                self._refresh_chat_window()
+                                result["ok"] = True
+                            elif cmd == "chat_visibility":
+                                self._set_chat_enabled_ui(bool(payload.get("enabled", False)))
+                                result["ok"] = True
+                            elif cmd == "broadcast_frame":
+                                self._render_broadcast_frame(payload.get("image"))
+                                result["ok"] = True
+                            elif cmd == "broadcast_clear":
+                                self._clear_broadcast_ui()
+                                result["ok"] = True
+                            else:
+                                result["ok"] = False
+                        except Exception:
+                            result["ok"] = False
+                        finally:
+                            done.set()
                 except Exception:
-                    result["ok"] = False
+                    exc_type, exc_val, exc_tb = sys.exc_info()
+                    if exc_type is not None:
+                        self._report_tk_callback_exception(exc_type, exc_val, exc_tb)
                 finally:
-                    done.set()
-            if self._root is not None:
-                self._root.after(50, pump_commands)
+                    if self._root is not None:
+                        try:
+                            self._root.after(50, pump_commands)
+                        except Exception:
+                            pass
 
-        self._root.after(50, pump_commands)
-        self._root.mainloop()
+            self._root.after(50, pump_commands)
+            self._root.mainloop()
+        finally:
+            self._ui_ready_event.clear()
+            self._root = None
+            self._lock_frame = None
+            self._auth_frame = None
+            self._connecting_frame = None
+            self._broadcast_frame = None
+            self._broadcast_image_label = None
+            self._broadcast_status_label = None
+            self._broadcast_photo = None
+            self._toast_label = None
+            self._chat_window = None
+            self._chat_scroll = None
+            self._chat_launcher = None
+            self._chat_launcher_button = None
+            self._toast_after_id = None
+            self._chat_timer_after_id = None
+            with self._worker_lock:
+                self._worker_started = False
+                self._worker_thread = None
 
     def set_state(self, state: OverlayState, timeout_s: float = 2.0) -> bool:
         self._ensure_worker()
@@ -779,6 +1074,20 @@ class OverlayController:
             return self._auth_result_q.get(timeout=timeout_s)
         except queue.Empty:
             return None
+
+    def show_broadcast_frame_async(self, image: Image.Image) -> bool:
+        self._ensure_worker()
+        if not self._ui_ready_event.is_set():
+            return False
+        self._cmd_q.put(("broadcast_frame", {"image": image}, threading.Event(), {"ok": False}))
+        return True
+
+    def clear_broadcast_frame_async(self) -> bool:
+        self._ensure_worker()
+        if not self._ui_ready_event.is_set():
+            return False
+        self._cmd_q.put(("broadcast_clear", {}, threading.Event(), {"ok": False}))
+        return True
 
 
 class TimerManager:
@@ -910,6 +1219,8 @@ class StudentDeployClient:
 
         self.control_sock: Optional[socket.socket] = None
         self.video_sock: Optional[socket.socket] = None
+        self.broadcast_sock: Optional[socket.socket] = None
+        self.broadcast_audio_sock: Optional[socket.socket] = None
         self.control_file = None
         self.send_lock = threading.Lock()
         self.conn_lock = threading.Lock()
@@ -937,6 +1248,10 @@ class StudentDeployClient:
         self.state_lock = threading.Lock()
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
+        self._showing_connection_overlay = False
+        self.broadcast_active = False
+        self._broadcast_audio_missing_warned = False
+        self._broadcast_audio_device_warned = False
 
     def _state_snapshot(self) -> dict:
         with self.state_lock:
@@ -946,12 +1261,27 @@ class StudentDeployClient:
                 "current_user": self.current_user,
                 "signout_lock_active": bool(self.signout_lock_active),
                 "temporary_lock_active": bool(self.temporary_lock_active),
+                "broadcast_active": bool(self.broadcast_active),
             }
 
     def _update_state(self, **changes) -> None:
         with self.state_lock:
             for key, value in changes.items():
                 setattr(self, key, value)
+
+    def _should_show_connection_overlay(self, snapshot: Optional[dict] = None) -> bool:
+        current = snapshot if snapshot is not None else self._state_snapshot()
+        return (not current["current_user"]) and (not current["temporary_lock_active"])
+
+    def _show_connection_wait_ui(self) -> None:
+        snapshot = self._state_snapshot()
+        if not self._should_show_connection_overlay(snapshot):
+            self._showing_connection_overlay = False
+            return
+        if self._showing_connection_overlay:
+            return
+        if self.overlay.set_state(OverlayState.CONNECTING, timeout_s=0.5):
+            self._showing_connection_overlay = True
 
     def _chat_remaining_s(self) -> Optional[int]:
         snapshot = self._state_snapshot()
@@ -1017,8 +1347,11 @@ class StudentDeployClient:
 
     def _restore_overlay_state(self) -> bool:
         snapshot = self._state_snapshot()
+        self._showing_connection_overlay = False
         chat_enabled = bool(self.enable_session_messaging and snapshot["current_user"] and (not snapshot["signout_lock_active"]))
         self.overlay.set_chat_enabled(chat_enabled)
+        if snapshot["broadcast_active"]:
+            return self.overlay.set_state(OverlayState.BROADCAST)
         if snapshot["signout_lock_active"] or not snapshot["current_user"]:
             return self.overlay.set_state(OverlayState.AUTH_REQUIRED)
         if snapshot["temporary_lock_active"]:
@@ -1077,20 +1410,53 @@ class StudentDeployClient:
                 return
         self._send_udp_json(ack)
 
-    def _execute_command(self, msg: dict) -> dict:
+    def _make_ack(self, command: object, cmd_id: str, applied: bool, reason: str = "") -> dict:
+        return {
+            "type": "ack",
+            "pc_id": self.pc_id,
+            "command": command,
+            "cmd_id": cmd_id,
+            "result": "applied" if applied else "failed",
+            "reason": reason,
+        }
+
+    def _start_broadcast_session(self) -> bool:
+        self._update_state(broadcast_active=True)
+        self.overlay.clear_broadcast_frame_async()
+        applied = self.overlay.set_state(OverlayState.BROADCAST)
+        if not applied:
+            self._update_state(broadcast_active=False)
+        return applied
+
+    def _stop_broadcast_session(self) -> bool:
+        self._update_state(broadcast_active=False)
+        self._close_broadcast_socket()
+        self._close_broadcast_audio_socket()
+        self.overlay.clear_broadcast_frame_async()
+        return self._restore_overlay_state()
+
+    def _run_power_command(self, action: str) -> None:
+        system_name = platform.system().strip().lower()
+        if system_name != "windows":
+            return
+        if action == "SHUTDOWN":
+            os.system("shutdown /s /t 0")
+        elif action == "RESTART":
+            os.system("shutdown /r /t 0")
+
+    def _schedule_power_command(self, action: str):
+        def _runner() -> None:
+            threading.Thread(target=self._run_power_command, args=(action,), daemon=True).start()
+        return _runner
+
+    def _execute_command(self, msg: dict, *, from_udp: bool = False):
         command = msg.get("command")
         cmd_id = str(msg.get("cmd_id", "")).strip()
         if self._is_duplicate_command(cmd_id):
-            return {
-                "type": "ack",
-                "pc_id": self.pc_id,
-                "command": command,
-                "cmd_id": cmd_id,
-                "result": "applied",
-                "reason": "duplicate_ignored",
-            }
+            return self._make_ack(command, cmd_id, True, "duplicate_ignored"), None
         applied = True
         reason = ""
+        post_action = None
         if command == "LOCK_NOW":
             lock_mode = str(msg.get("lock_mode", "temporary")).strip().lower()
             if lock_mode == "signout":
@@ -1218,17 +1584,44 @@ class StudentDeployClient:
             except Exception:
                 applied = False
                 reason = "extension_offer_failed"
+        elif command == "BROADCAST_START":
+            try:
+                applied = self._start_broadcast_session()
+                if not applied:
+                    reason = "broadcast_start_failed"
+            except Exception:
+                applied = False
+                reason = "broadcast_start_failed"
+        elif command == "BROADCAST_STOP":
+            try:
+                applied = self._stop_broadcast_session()
+                if not applied:
+                    reason = "broadcast_stop_failed"
+            except Exception:
+                applied = False
+                reason = "broadcast_stop_failed"
+        elif command == "SHUTDOWN":
+            if from_udp:
+                applied = False
+                reason = "tcp_required"
+            elif platform.system().strip().lower() != "windows":
+                applied = False
+                reason = "unsupported_platform"
+            else:
+                post_action = self._schedule_power_command("SHUTDOWN")
+        elif command == "RESTART":
+            if from_udp:
+                applied = False
+                reason = "tcp_required"
+            elif platform.system().strip().lower() != "windows":
+                applied = False
+                reason = "unsupported_platform"
+            else:
+                post_action = self._schedule_power_command("RESTART")
         else:
             applied = False
             reason = "unsupported_command"
-        return {
-            "type": "ack",
-            "pc_id": self.pc_id,
-            "command": command,
-            "cmd_id": cmd_id,
-            "result": "applied" if applied else "failed",
-            "reason": reason,
-        }
+        return self._make_ack(command, cmd_id, applied, reason), post_action
 
     def _udp_fallback_loop(self) -> None:
         while True:
@@ -1244,8 +1637,10 @@ class StudentDeployClient:
                         continue
                     if msg.get("type") != "command":
                         continue
-                    ack = self._execute_command(msg)
+                    ack, post_action = self._execute_command(msg, from_udp=True)
                     self._send_ack(ack)
+                    if post_action is not None:
+                        post_action()
             except OSError:
                 time.sleep(1)
             except Exception:
@@ -1356,20 +1751,83 @@ class StudentDeployClient:
         except OSError:
             return False
 
+    def _connect_broadcast_video(self) -> bool:
+        if not self.pc_id:
+            return False
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((self.teacher_ip, NETWORK.video_port))
+            send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_downlink"})
+            with self.conn_lock:
+                existing = self.broadcast_sock
+                self.broadcast_sock = sock
+            if existing is not None and existing is not sock:
+                try:
+                    existing.close()
+                except OSError:
+                    pass
+            return True
+        except OSError:
+            return False
+
+    def _connect_broadcast_audio(self) -> bool:
+        if not self.pc_id:
+            return False
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((self.teacher_ip, NETWORK.video_port))
+            send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_audio_downlink"})
+            with self.conn_lock:
+                existing = self.broadcast_audio_sock
+                self.broadcast_audio_sock = sock
+            if existing is not None and existing is not sock:
+                try:
+                    existing.close()
+                except OSError:
+                    pass
+            return True
+        except OSError:
+            return False
+
+    def _close_broadcast_socket(self) -> None:
+        with self.conn_lock:
+            sock = self.broadcast_sock
+            self.broadcast_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _close_broadcast_audio_socket(self) -> None:
+        with self.conn_lock:
+            sock = self.broadcast_audio_sock
+            self.broadcast_audio_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def _cleanup_sockets(self) -> None:
         with self.conn_lock:
             control_sock = self.control_sock
             video_sock = self.video_sock
+            broadcast_sock = self.broadcast_sock
+            broadcast_audio_sock = self.broadcast_audio_sock
             control_file = self.control_file
             self.control_sock = None
             self.video_sock = None
+            self.broadcast_sock = None
+            self.broadcast_audio_sock = None
             self.control_file = None
+        self._update_state(broadcast_active=False)
         if control_file is not None:
             try:
                 control_file.close()
             except OSError:
                 pass
-        for sock in (control_sock, video_sock):
+        for sock in (control_sock, video_sock, broadcast_sock, broadcast_audio_sock):
             if sock:
                 try:
                     sock.close()
@@ -1384,16 +1842,19 @@ class StudentDeployClient:
                     time.sleep(0.2)
                     continue
                 self._update_state(connecting=True)
+                self._show_connection_wait_ui()
                 ok_control = self._connect_control()
                 ok_video = self._connect_video() if ok_control else False
                 is_connected = bool(ok_control and ok_video)
                 self._update_state(connected=is_connected, connecting=False)
                 if not is_connected:
+                    self._show_connection_wait_ui()
                     self._cleanup_sockets()
                     sleep_time = self.dynamic_reconnect_interval_s + random.uniform(0, 0.4)
                     time.sleep(sleep_time)
             except Exception:
                 self._update_state(connecting=False, connected=False)
+                self._show_connection_wait_ui()
                 self._cleanup_sockets()
                 sleep_time = self.dynamic_reconnect_interval_s + random.uniform(0, 0.4)
                 time.sleep(sleep_time)
@@ -1474,8 +1935,10 @@ class StudentDeployClient:
                     continue
                 if msg_type != "command":
                     continue
-                ack = self._execute_command(msg)
+                ack, post_action = self._execute_command(msg, from_udp=False)
                 self._send_ack(ack)
+                if post_action is not None:
+                    post_action()
             except TimeoutError:
                 continue
             except OSError:
@@ -1513,6 +1976,104 @@ class StudentDeployClient:
                 self._update_state(connected=False)
                 self._cleanup_sockets()
                 time.sleep(0.2)
+
+    def _broadcast_receiver_loop(self) -> None:
+        while True:
+            try:
+                snapshot = self._state_snapshot()
+                if not snapshot["broadcast_active"]:
+                    self._close_broadcast_socket()
+                    time.sleep(0.2)
+                    continue
+
+                with self.conn_lock:
+                    sock = self.broadcast_sock
+                if sock is None:
+                    if (not snapshot["connected"]) or (not self.pc_id):
+                        time.sleep(0.2)
+                        continue
+                    if not self._connect_broadcast_video():
+                        time.sleep(1)
+                    continue
+
+                frame_data = recv_frame(sock)
+                if frame_data is None:
+                    self._close_broadcast_socket()
+                    time.sleep(0.2)
+                    continue
+                np_buf = numpy.frombuffer(frame_data, dtype=numpy.uint8)
+                frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                self.overlay.show_broadcast_frame_async(Image.fromarray(rgb))
+            except OSError:
+                self._close_broadcast_socket()
+                time.sleep(0.5)
+            except Exception:
+                self._close_broadcast_socket()
+                time.sleep(0.5)
+
+    def _broadcast_audio_receiver_loop(self) -> None:
+        while True:
+            try:
+                snapshot = self._state_snapshot()
+                if not snapshot["broadcast_active"]:
+                    self._close_broadcast_audio_socket()
+                    time.sleep(0.2)
+                    continue
+                if sd is None:
+                    if not self._broadcast_audio_missing_warned:
+                        print("[Broadcast Audio] sounddevice is not installed.")
+                        self._broadcast_audio_missing_warned = True
+                    time.sleep(2.0)
+                    continue
+                self._broadcast_audio_missing_warned = False
+                try:
+                    with sd.OutputStream(
+                        samplerate=AUDIO_SAMPLE_RATE,
+                        channels=AUDIO_CHANNELS,
+                        dtype=AUDIO_DTYPE,
+                        blocksize=AUDIO_BLOCK_SIZE,
+                    ) as stream:
+                        self._broadcast_audio_device_warned = False
+                        while True:
+                            snapshot = self._state_snapshot()
+                            if not snapshot["broadcast_active"]:
+                                self._close_broadcast_audio_socket()
+                                break
+                            with self.conn_lock:
+                                sock = self.broadcast_audio_sock
+                            if sock is None:
+                                if (not snapshot["connected"]) or (not self.pc_id):
+                                    time.sleep(0.2)
+                                    continue
+                                if not self._connect_broadcast_audio():
+                                    time.sleep(1.0)
+                                continue
+                            audio_data = recv_frame(sock)
+                            if audio_data is None:
+                                self._close_broadcast_audio_socket()
+                                time.sleep(0.2)
+                                continue
+                            if len(audio_data) % numpy.dtype(numpy.int16).itemsize != 0:
+                                continue
+                            samples = numpy.frombuffer(audio_data, dtype=numpy.int16)
+                            if samples.size == 0:
+                                continue
+                            stream.write(samples.reshape(-1, AUDIO_CHANNELS))
+                except Exception as exc:
+                    if not self._broadcast_audio_device_warned:
+                        print(f"[Broadcast Audio] {exc}")
+                        self._broadcast_audio_device_warned = True
+                    self._close_broadcast_audio_socket()
+                    time.sleep(1.0)
+            except OSError:
+                self._close_broadcast_audio_socket()
+                time.sleep(0.5)
+            except Exception:
+                self._close_broadcast_audio_socket()
+                time.sleep(0.5)
 
     def _on_timer_warning(self, timer_id: str, remaining_ms: int) -> None:
         if not self.enable_timer_near_limit_notify:
@@ -1585,6 +2146,8 @@ class StudentDeployClient:
         threading.Thread(target=self._control_loop, daemon=True).start()
         threading.Thread(target=self._udp_fallback_loop, daemon=True).start()
         threading.Thread(target=self._video_loop, daemon=True).start()
+        threading.Thread(target=self._broadcast_receiver_loop, daemon=True).start()
+        threading.Thread(target=self._broadcast_audio_receiver_loop, daemon=True).start()
 
         try:
             while True:
