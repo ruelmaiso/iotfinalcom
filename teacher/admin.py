@@ -601,7 +601,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_bind_host, NETWORK.control_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.control_port))
                 sock.listen()
                 while True:
                     client_sock, addr = sock.accept()
@@ -1315,7 +1315,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_bind_host, NETWORK.command_fallback_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.command_fallback_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:
@@ -1340,7 +1340,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_bind_host, NETWORK.video_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.video_port))
                 sock.listen()
                 while True:
                     client_sock, _ = sock.accept()
@@ -1708,7 +1708,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_bind_host, NETWORK.sensor_port))
+                sock.bind((self.settings.teacher_bind_host, NETWORK.sensor_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:
@@ -3667,12 +3667,15 @@ class TeacherDeployUI:
 
         tab = ctk.CTkTabview(win, fg_color=colors["card_bg"])
         tab.pack(fill="both", expand=True, padx=12, pady=12)
+        network_tab = tab.add("Network")
         stream_tab = tab.add("Streaming")
         runtime_tab = tab.add("Runtime")
         recording_tab = tab.add("Recording")
         appearance_tab = tab.add("Appearance")
         session_tab = tab.add("Sessions")
 
+        bind_host_var = ctk.StringVar(value=st.teacher_bind_host)
+        connect_host_var = ctk.StringVar(value=st.teacher_connect_host)
         main_var = ctk.StringVar(value=st.main_stream_profile)
         prev_var = ctk.StringVar(value=st.preview_stream_profile)
         rec_var = ctk.StringVar(value=st.recording_mode)
@@ -3731,6 +3734,43 @@ class TeacherDeployUI:
             except ValueError:
                 return "Example: 5.0 means the folder is trimmed after about 5 GB."
             return f"Current value: keep total recordings under about {limit:.1f} GB."
+
+        add_tab_note(
+            network_tab,
+            "Network settings control how the Teacher/Admin server listens and what IP address students should use. Restart the admin app after changing the bind address.",
+        )
+
+        def add_text_field(parent, label: str, var: ctk.StringVar, help_text: str = "") -> ctk.CTkEntry:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(10, 2))
+            ctk.CTkLabel(row, text=label, width=200, anchor="w", text_color=colors["text_primary"]).pack(side="left")
+            entry = ctk.CTkEntry(row, textvariable=var, height=34)
+            entry.pack(side="left", fill="x", expand=True)
+            if help_text:
+                ctk.CTkLabel(
+                    parent,
+                    text=help_text,
+                    font=(self.FONT_FAMILY, 11),
+                    text_color=colors["text_secondary"],
+                    justify="left",
+                    wraplength=500,
+                ).pack(anchor="w", padx=(216, 12), pady=(0, 2))
+            return entry
+
+        bind_entry = add_text_field(
+            network_tab,
+            "Admin Bind IP",
+            bind_host_var,
+            "Use 0.0.0.0 to listen on all network adapters. Changing this requires restarting the admin app.",
+        )
+        connect_entry = add_text_field(
+            network_tab,
+            "Student Connect IP",
+            connect_host_var,
+            "This is the Teacher/Admin computer IP students should enter in their connecting overlay.",
+        )
+        network_error = ctk.CTkLabel(network_tab, text="", font=(self.FONT_FAMILY, 11), text_color=ESSU_ERROR)
+        network_error.pack(anchor="w", padx=(216, 12), pady=(0, 6))
 
         add_tab_note(
             stream_tab,
@@ -3972,6 +4012,19 @@ class TeacherDeployUI:
                 error_labels[key].configure(text="")
 
             parsed: dict[str, float] = {}
+            network_error.configure(text="")
+            bind_entry.configure(border_color=colors["border"])
+            connect_entry.configure(border_color=colors["border"])
+
+            def normalize_host(raw: str, field_name: str) -> str:
+                host = str(raw or "").strip()
+                if not host:
+                    raise ValueError(f"{field_name} is required.")
+                if any(ch.isspace() for ch in host):
+                    raise ValueError(f"{field_name} cannot contain spaces.")
+                if len(host) > 255:
+                    raise ValueError(f"{field_name} is too long.")
+                return host
 
             def parse_required_number(key: str, raw: str, caster) -> bool:
                 try:
@@ -3989,10 +4042,21 @@ class TeacherDeployUI:
             valid = parse_required_number("recording_max_gb", maxgb_var.get() or "5", float) and valid
             valid = parse_required_number("session_duration_s", sess_var.get() or "7200", int) and valid
             valid = parse_required_number("daily_limit_s", day_var.get() or "7200", int) and valid
+            try:
+                teacher_bind_host = normalize_host(bind_host_var.get(), "Admin Bind IP")
+                teacher_connect_host = normalize_host(connect_host_var.get(), "Student Connect IP")
+            except ValueError as exc:
+                bind_entry.configure(border_color=ESSU_ERROR)
+                connect_entry.configure(border_color=ESSU_ERROR)
+                network_error.configure(text=str(exc))
+                tab.set("Network")
+                return
             if not valid:
                 return
 
             settings = AppSettings(
+                teacher_bind_host=teacher_bind_host,
+                teacher_connect_host=teacher_connect_host,
                 main_stream_profile=main_var.get(),
                 preview_stream_profile=prev_var.get(),
                 recording_mode=rec_var.get(),
