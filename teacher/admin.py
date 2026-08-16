@@ -852,11 +852,22 @@ class TeacherDeployServer:
         session_duration_ms = int(session_limit_s) * 1000
         server_ts = time.time()
         with self.lock:
-            if pc_id in self.clients:
-                session_id = self.auth_db.open_session(pc_id, user)
-                client = self.clients[pc_id]
-                existing_timer = client.session_timer
-                if existing_timer is not None and client.student_number == user["student_number"]:
+            client = self.clients.get(pc_id)
+            existing_timer = client.session_timer if client else None
+            existing_student_number = client.student_number if client else ""
+        if client is None:
+            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
+            return
+
+        session_id = self.auth_db.open_session(pc_id, user)
+
+        login_aborted = False
+        with self.lock:
+            client = self.clients.get(pc_id)
+            if client is None or client.control_sock is not client_sock:
+                login_aborted = True
+            else:
+                if existing_timer is not None and existing_student_number == user["student_number"]:
                     existing_remaining_ms = self._timer_remaining_ms(existing_timer, server_ts)
                     if existing_remaining_ms > 0:
                         session_duration_ms = min(session_duration_ms, int(existing_remaining_ms))
@@ -871,9 +882,10 @@ class TeacherDeployServer:
                 client.interrupted_remaining_s = 0
                 client.interrupted_until_ts = None
                 client.interrupted_student_number = ""
-            else:
-                send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
-                return
+        if login_aborted:
+            self.auth_db.close_active_session(pc_id, status="login_aborted")
+            send_json(client_sock, {"type": "auth_ack", "action": "login", "ok": False, "reason": "unknown_pc"})
+            return
         self._send_control_json(pc_id, client_sock, {
             "type": "auth_ack",
             "action": "login",
@@ -887,14 +899,14 @@ class TeacherDeployServer:
             client = self.clients.get(pc_id)
             session_timer_payload = self._session_timer_payload(client.session_timer) if client else None
             login_ts = float(client.session_timer.start_ts) if (client and client.session_timer) else time.time()
-        self.active_sessions_by_pc_id[pc_id] = {
-            "session_id": session_id,
-            "full_name": user["full_name"],
-            "student_number": user["student_number"],
-            "year_section": user["year_section"],
-            "login_ts": login_ts,
-            "session_timer": session_timer_payload,
-        }
+            self.active_sessions_by_pc_id[pc_id] = {
+                "session_id": session_id,
+                "full_name": user["full_name"],
+                "student_number": user["student_number"],
+                "year_section": user["year_section"],
+                "login_ts": login_ts,
+                "session_timer": session_timer_payload,
+            }
         self._put_bounded(self.status_queue, pc_id)
         self._persist_session_timers()
 
