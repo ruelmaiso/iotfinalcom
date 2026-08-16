@@ -232,10 +232,13 @@ class TeacherDeployServer:
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self.broadcast_target_ids: set[str] = set()
+        self.broadcast_lifecycle_lock = threading.Lock()
         self.broadcast_thread: Optional[threading.Thread] = None
         self.broadcast_stop_event = threading.Event()
+        self.broadcast_worker_generation: int = 0
         self.broadcast_audio_thread: Optional[threading.Thread] = None
         self.broadcast_audio_stop_event = threading.Event()
+        self.broadcast_audio_worker_generation: int = 0
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -1381,24 +1384,73 @@ class TeacherDeployServer:
         return profile_map.get(self.settings.main_stream_profile, profile_map["720p"])
 
     def _ensure_broadcast_loop(self) -> None:
-        if self.broadcast_thread is not None and self.broadcast_thread.is_alive():
-            return
-        self.broadcast_stop_event.clear()
-        self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, daemon=True)
-        self.broadcast_thread.start()
+        with self.broadcast_lifecycle_lock:
+            if (
+                self.broadcast_thread is not None
+                and self.broadcast_thread.is_alive()
+                and not self.broadcast_stop_event.is_set()
+            ):
+                return
+            self.broadcast_worker_generation += 1
+            generation = self.broadcast_worker_generation
+            stop_event = threading.Event()
+            self.broadcast_stop_event = stop_event
+            self.broadcast_thread = threading.Thread(
+                target=self._run_broadcast_loop,
+                args=(generation, stop_event),
+                daemon=True,
+            )
+            self.broadcast_thread.start()
 
     def _ensure_broadcast_audio_loop(self) -> None:
-        if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive():
-            return
-        self.broadcast_audio_stop_event.clear()
-        self.broadcast_audio_thread = threading.Thread(target=self._run_broadcast_audio_loop, daemon=True)
-        self.broadcast_audio_thread.start()
+        with self.broadcast_lifecycle_lock:
+            if (
+                self.broadcast_audio_thread is not None
+                and self.broadcast_audio_thread.is_alive()
+                and not self.broadcast_audio_stop_event.is_set()
+            ):
+                return
+            self.broadcast_audio_worker_generation += 1
+            generation = self.broadcast_audio_worker_generation
+            stop_event = threading.Event()
+            self.broadcast_audio_stop_event = stop_event
+            self.broadcast_audio_thread = threading.Thread(
+                target=self._run_broadcast_audio_loop,
+                args=(generation, stop_event),
+                daemon=True,
+            )
+            self.broadcast_audio_thread.start()
 
-    def _run_broadcast_loop(self) -> None:
+    def _join_stopped_broadcast_workers(self) -> None:
+        with self.broadcast_lifecycle_lock:
+            video_thread = self.broadcast_thread if self.broadcast_stop_event.is_set() else None
+            audio_thread = self.broadcast_audio_thread if self.broadcast_audio_stop_event.is_set() else None
+
+        for worker in (video_thread, audio_thread):
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=0.75)
+
+        with self.broadcast_lifecycle_lock:
+            if self.broadcast_thread is not None and not self.broadcast_thread.is_alive():
+                self.broadcast_thread = None
+            if self.broadcast_audio_thread is not None and not self.broadcast_audio_thread.is_alive():
+                self.broadcast_audio_thread = None
+
+    def _is_current_broadcast_worker(self, generation: int, stop_event: threading.Event) -> bool:
+        with self.broadcast_lifecycle_lock:
+            return self.broadcast_worker_generation == generation and self.broadcast_stop_event is stop_event
+
+    def _is_current_broadcast_audio_worker(self, generation: int, stop_event: threading.Event) -> bool:
+        with self.broadcast_lifecycle_lock:
+            return self.broadcast_audio_worker_generation == generation and self.broadcast_audio_stop_event is stop_event
+
+    def _run_broadcast_loop(self, generation: int, stop_event: threading.Event) -> None:
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
-                while not self.broadcast_stop_event.is_set():
+                while not stop_event.is_set():
+                    if not self._is_current_broadcast_worker(generation, stop_event):
+                        break
                     with self.lock:
                         target_ids = list(self.broadcast_target_ids)
                     if not target_ids:
@@ -1433,13 +1485,14 @@ class TeacherDeployServer:
                             failed_socks.append(client_sock)
 
                     if failed_ids:
-                        with self.lock:
-                            for pc_id, failed_sock in zip(failed_ids, failed_socks):
-                                client = self.clients.get(pc_id)
-                                if client and client.broadcast_sock is failed_sock:
-                                    client.broadcast_sock = None
-                                self.broadcast_target_ids.discard(pc_id)
-                                self._put_bounded(self.status_queue, pc_id)
+                        if self._is_current_broadcast_worker(generation, stop_event):
+                            with self.lock:
+                                for pc_id, failed_sock in zip(failed_ids, failed_socks):
+                                    client = self.clients.get(pc_id)
+                                    if client and client.broadcast_sock is failed_sock:
+                                        client.broadcast_sock = None
+                                    self.broadcast_target_ids.discard(pc_id)
+                                    self._put_bounded(self.status_queue, pc_id)
                         for failed_sock in failed_socks:
                             try:
                                 failed_sock.close()
@@ -1450,60 +1503,78 @@ class TeacherDeployServer:
         except Exception as exc:
             self._log_event("broadcast_loop_error", reason=str(exc))
         finally:
-            self.broadcast_stop_event.set()
+            stop_event.set()
+            with self.broadcast_lifecycle_lock:
+                if self.broadcast_worker_generation == generation:
+                    self.broadcast_stop_event = stop_event
+                    if self.broadcast_thread is threading.current_thread():
+                        self.broadcast_thread = None
 
-    def _run_broadcast_audio_loop(self) -> None:
-        if sd is None:
-            self._log_event("broadcast_audio_unavailable", reason="sounddevice_not_installed")
-            return
-        while not self.broadcast_audio_stop_event.is_set():
-            with self.lock:
-                target_ids = list(self.broadcast_target_ids)
-            if not target_ids:
-                break
-            try:
-                with sd.InputStream(
-                    samplerate=AUDIO_SAMPLE_RATE,
-                    channels=AUDIO_CHANNELS,
-                    dtype=AUDIO_DTYPE,
-                    blocksize=AUDIO_BLOCK_SIZE,
-                ) as stream:
-                    while not self.broadcast_audio_stop_event.is_set():
-                        with self.lock:
-                            target_ids = list(self.broadcast_target_ids)
-                        if not target_ids:
-                            return
-                        audio_chunk, _overflowed = stream.read(AUDIO_BLOCK_SIZE)
-                        audio_bytes = numpy.asarray(audio_chunk, dtype=numpy.int16).tobytes()
-                        recipients: list[tuple[str, socket.socket]] = []
-                        with self.lock:
-                            for pc_id in target_ids:
-                                client = self.clients.get(pc_id)
-                                if not client or not client.online or client.broadcast_audio_sock is None:
-                                    continue
-                                recipients.append((pc_id, client.broadcast_audio_sock))
-
-                        failed_socks: list[socket.socket] = []
-                        for pc_id, client_sock in recipients:
-                            try:
-                                send_frame(client_sock, audio_bytes)
-                            except OSError:
-                                failed_socks.append(client_sock)
-                                with self.lock:
-                                    client = self.clients.get(pc_id)
-                                    if client and client.broadcast_audio_sock is client_sock:
-                                        client.broadcast_audio_sock = None
-                                        self._put_bounded(self.status_queue, pc_id)
-                        for failed_sock in failed_socks:
-                            try:
-                                failed_sock.close()
-                            except OSError:
-                                pass
-            except Exception as exc:
-                self._log_event("broadcast_audio_error", reason=str(exc))
-                if self.broadcast_audio_stop_event.wait(1.0):
+    def _run_broadcast_audio_loop(self, generation: int, stop_event: threading.Event) -> None:
+        try:
+            if sd is None:
+                self._log_event("broadcast_audio_unavailable", reason="sounddevice_not_installed")
+                return
+            while not stop_event.is_set():
+                if not self._is_current_broadcast_audio_worker(generation, stop_event):
                     break
-        self.broadcast_audio_stop_event.set()
+                with self.lock:
+                    target_ids = list(self.broadcast_target_ids)
+                if not target_ids:
+                    break
+                try:
+                    with sd.InputStream(
+                        samplerate=AUDIO_SAMPLE_RATE,
+                        channels=AUDIO_CHANNELS,
+                        dtype=AUDIO_DTYPE,
+                        blocksize=AUDIO_BLOCK_SIZE,
+                    ) as stream:
+                        while not stop_event.is_set():
+                            if not self._is_current_broadcast_audio_worker(generation, stop_event):
+                                return
+                            with self.lock:
+                                target_ids = list(self.broadcast_target_ids)
+                            if not target_ids:
+                                return
+                            audio_chunk, _overflowed = stream.read(AUDIO_BLOCK_SIZE)
+                            audio_bytes = numpy.asarray(audio_chunk, dtype=numpy.int16).tobytes()
+                            recipients: list[tuple[str, socket.socket]] = []
+                            with self.lock:
+                                for pc_id in target_ids:
+                                    client = self.clients.get(pc_id)
+                                    if not client or not client.online or client.broadcast_audio_sock is None:
+                                        continue
+                                    recipients.append((pc_id, client.broadcast_audio_sock))
+
+                            failed_socks: list[tuple[str, socket.socket]] = []
+                            for pc_id, client_sock in recipients:
+                                try:
+                                    send_frame(client_sock, audio_bytes)
+                                except OSError:
+                                    failed_socks.append((pc_id, client_sock))
+                            if failed_socks and self._is_current_broadcast_audio_worker(generation, stop_event):
+                                with self.lock:
+                                    for pc_id, client_sock in failed_socks:
+                                        client = self.clients.get(pc_id)
+                                        if client and client.broadcast_audio_sock is client_sock:
+                                            client.broadcast_audio_sock = None
+                                            self._put_bounded(self.status_queue, pc_id)
+                            for _pc_id, failed_sock in failed_socks:
+                                try:
+                                    failed_sock.close()
+                                except OSError:
+                                    pass
+                except Exception as exc:
+                    self._log_event("broadcast_audio_error", reason=str(exc))
+                    if stop_event.wait(1.0):
+                        break
+        finally:
+            stop_event.set()
+            with self.broadcast_lifecycle_lock:
+                if self.broadcast_audio_worker_generation == generation:
+                    self.broadcast_audio_stop_event = stop_event
+                    if self.broadcast_audio_thread is threading.current_thread():
+                        self.broadcast_audio_thread = None
 
     def start_broadcast(self, targets: list[str]) -> list[str]:
         with self.lock:
@@ -1552,8 +1623,9 @@ class TeacherDeployServer:
                     client.broadcast_audio_sock = None
                 self.broadcast_target_ids.discard(pc_id)
         if not self.broadcast_target_ids:
-            self.broadcast_stop_event.set()
-            self.broadcast_audio_stop_event.set()
+            with self.broadcast_lifecycle_lock:
+                self.broadcast_stop_event.set()
+                self.broadcast_audio_stop_event.set()
         for client_sock in sockets_to_close:
             try:
                 client_sock.close()
@@ -1562,6 +1634,8 @@ class TeacherDeployServer:
         for pc_id in sorted(target_set):
             self.send_command(pc_id, "BROADCAST_STOP")
             self._put_bounded(self.status_queue, pc_id)
+        if not self.broadcast_target_ids:
+            self._join_stopped_broadcast_workers()
         if target_set:
             self._log_event("broadcast_stopped", targets=",".join(sorted(target_set)))
         return sorted(target_set)
