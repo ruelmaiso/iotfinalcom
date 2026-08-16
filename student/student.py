@@ -1756,12 +1756,17 @@ class StudentDeployClient:
             return False
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
             sock.connect((self.teacher_ip, NETWORK.video_port))
             send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_downlink"})
             with self.conn_lock:
                 existing = self.broadcast_sock
                 self.broadcast_sock = sock
             if existing is not None and existing is not sock:
+                try:
+                    existing.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     existing.close()
                 except OSError:
@@ -1775,12 +1780,17 @@ class StudentDeployClient:
             return False
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
             sock.connect((self.teacher_ip, NETWORK.video_port))
             send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_audio_downlink"})
             with self.conn_lock:
                 existing = self.broadcast_audio_sock
                 self.broadcast_audio_sock = sock
             if existing is not None and existing is not sock:
+                try:
+                    existing.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     existing.close()
                 except OSError:
@@ -1795,6 +1805,10 @@ class StudentDeployClient:
             self.broadcast_sock = None
         if sock is not None:
             try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 sock.close()
             except OSError:
                 pass
@@ -1804,6 +1818,10 @@ class StudentDeployClient:
             sock = self.broadcast_audio_sock
             self.broadcast_audio_sock = None
         if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 sock.close()
             except OSError:
@@ -1829,6 +1847,10 @@ class StudentDeployClient:
                 pass
         for sock in (control_sock, video_sock, broadcast_sock, broadcast_audio_sock):
             if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     sock.close()
                 except OSError:
@@ -1996,7 +2018,10 @@ class StudentDeployClient:
                         time.sleep(1)
                     continue
 
-                frame_data = recv_frame(sock)
+                try:
+                    frame_data = recv_frame(sock)
+                except socket.timeout:
+                    continue
                 if frame_data is None:
                     self._close_broadcast_socket()
                     time.sleep(0.2)
@@ -2051,7 +2076,10 @@ class StudentDeployClient:
                                 if not self._connect_broadcast_audio():
                                     time.sleep(1.0)
                                 continue
-                            audio_data = recv_frame(sock)
+                            try:
+                                audio_data = recv_frame(sock)
+                            except socket.timeout:
+                                continue
                             if audio_data is None:
                                 self._close_broadcast_audio_socket()
                                 time.sleep(0.2)

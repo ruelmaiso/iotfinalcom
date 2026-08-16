@@ -1379,6 +1379,18 @@ class TeacherDeployServer:
                 self.udp_send_sock = None
                 return False
 
+
+    @staticmethod
+    def _close_stream_socket(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
     def _broadcast_profile(self) -> tuple[int, int, int]:
         profile_map = {"360p": (640, 360, 60), "720p": (1280, 720, 80), "1080p": (1920, 1080, 90)}
         return profile_map.get(self.settings.main_stream_profile, profile_map["720p"])
@@ -1494,10 +1506,7 @@ class TeacherDeployServer:
                                     self.broadcast_target_ids.discard(pc_id)
                                     self._put_bounded(self.status_queue, pc_id)
                         for failed_sock in failed_socks:
-                            try:
-                                failed_sock.close()
-                            except OSError:
-                                pass
+                            self._close_stream_socket(failed_sock)
 
                     time.sleep(1 / max(1, RUNTIME.max_fps))
         except Exception as exc:
@@ -1560,10 +1569,7 @@ class TeacherDeployServer:
                                             client.broadcast_audio_sock = None
                                             self._put_bounded(self.status_queue, pc_id)
                             for _pc_id, failed_sock in failed_socks:
-                                try:
-                                    failed_sock.close()
-                                except OSError:
-                                    pass
+                                self._close_stream_socket(failed_sock)
                 except Exception as exc:
                     self._log_event("broadcast_audio_error", reason=str(exc))
                     if stop_event.wait(1.0):
@@ -1627,10 +1633,7 @@ class TeacherDeployServer:
                 self.broadcast_stop_event.set()
                 self.broadcast_audio_stop_event.set()
         for client_sock in sockets_to_close:
-            try:
-                client_sock.close()
-            except OSError:
-                pass
+            self._close_stream_socket(client_sock)
         for pc_id in sorted(target_set):
             self.send_command(pc_id, "BROADCAST_STOP")
             self._put_bounded(self.status_queue, pc_id)
@@ -1775,7 +1778,7 @@ class TeacherDeployServer:
                     self._log_event("broadcast_audio_disconnected", pc_id=pc_id)
                 else:
                     self._log_event("video_disconnected", pc_id=pc_id)
-            client_sock.close()
+            self._close_stream_socket(client_sock)
 
     def _run_sensor_server(self) -> None:
         while True:
