@@ -601,7 +601,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_host, NETWORK.control_port))
+                sock.bind((NETWORK.teacher_bind_host, NETWORK.control_port))
                 sock.listen()
                 while True:
                     client_sock, addr = sock.accept()
@@ -1315,7 +1315,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_host, NETWORK.command_fallback_port))
+                sock.bind((NETWORK.teacher_bind_host, NETWORK.command_fallback_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:
@@ -1340,7 +1340,7 @@ class TeacherDeployServer:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((NETWORK.teacher_host, NETWORK.video_port))
+                sock.bind((NETWORK.teacher_bind_host, NETWORK.video_port))
                 sock.listen()
                 while True:
                     client_sock, _ = sock.accept()
@@ -1708,7 +1708,7 @@ class TeacherDeployServer:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((NETWORK.teacher_host, NETWORK.sensor_port))
+                sock.bind((NETWORK.teacher_bind_host, NETWORK.sensor_port))
                 while True:
                     data, _ = sock.recvfrom(4096)
                     try:

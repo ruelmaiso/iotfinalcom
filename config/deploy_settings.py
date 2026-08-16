@@ -3,7 +3,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    teacher_host: str = "192.168.1.157" ##110.236
+    teacher_bind_host: str = "0.0.0.0"
+    teacher_connect_host: str = "192.168.1.157" ##110.236
+
+    @property
+    def teacher_host(self) -> str:
+        return self.teacher_connect_host
     control_port: int = 9201
     video_port: int = 9200
     sensor_port: int = 9202
