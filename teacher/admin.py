@@ -236,6 +236,7 @@ class TeacherDeployServer:
         self.broadcast_stop_event = threading.Event()
         self.broadcast_audio_thread: Optional[threading.Thread] = None
         self.broadcast_audio_stop_event = threading.Event()
+        self.broadcast_loop_lock = threading.Lock()
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -1381,24 +1382,30 @@ class TeacherDeployServer:
         return profile_map.get(self.settings.main_stream_profile, profile_map["720p"])
 
     def _ensure_broadcast_loop(self) -> None:
-        if self.broadcast_thread is not None and self.broadcast_thread.is_alive():
-            return
-        self.broadcast_stop_event.clear()
-        self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, daemon=True)
-        self.broadcast_thread.start()
+        with self.broadcast_loop_lock:
+            if self.broadcast_thread is not None and self.broadcast_thread.is_alive() and not self.broadcast_stop_event.is_set():
+                return
+            self.broadcast_stop_event.set()
+            self.broadcast_stop_event = threading.Event()
+            stop_event = self.broadcast_stop_event
+            self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, args=(stop_event,), daemon=True)
+            self.broadcast_thread.start()
 
     def _ensure_broadcast_audio_loop(self) -> None:
-        if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive():
-            return
-        self.broadcast_audio_stop_event.clear()
-        self.broadcast_audio_thread = threading.Thread(target=self._run_broadcast_audio_loop, daemon=True)
-        self.broadcast_audio_thread.start()
+        with self.broadcast_loop_lock:
+            if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive() and not self.broadcast_audio_stop_event.is_set():
+                return
+            self.broadcast_audio_stop_event.set()
+            self.broadcast_audio_stop_event = threading.Event()
+            stop_event = self.broadcast_audio_stop_event
+            self.broadcast_audio_thread = threading.Thread(target=self._run_broadcast_audio_loop, args=(stop_event,), daemon=True)
+            self.broadcast_audio_thread.start()
 
-    def _run_broadcast_loop(self) -> None:
+    def _run_broadcast_loop(self, stop_event: threading.Event) -> None:
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
-                while not self.broadcast_stop_event.is_set():
+                while not stop_event.is_set():
                     with self.lock:
                         target_ids = list(self.broadcast_target_ids)
                     if not target_ids:
@@ -1438,7 +1445,6 @@ class TeacherDeployServer:
                                 client = self.clients.get(pc_id)
                                 if client and client.broadcast_sock is failed_sock:
                                     client.broadcast_sock = None
-                                self.broadcast_target_ids.discard(pc_id)
                                 self._put_bounded(self.status_queue, pc_id)
                         for failed_sock in failed_socks:
                             try:
@@ -1449,14 +1455,12 @@ class TeacherDeployServer:
                     time.sleep(1 / max(1, RUNTIME.max_fps))
         except Exception as exc:
             self._log_event("broadcast_loop_error", reason=str(exc))
-        finally:
-            self.broadcast_stop_event.set()
 
-    def _run_broadcast_audio_loop(self) -> None:
+    def _run_broadcast_audio_loop(self, stop_event: threading.Event) -> None:
         if sd is None:
             self._log_event("broadcast_audio_unavailable", reason="sounddevice_not_installed")
             return
-        while not self.broadcast_audio_stop_event.is_set():
+        while not stop_event.is_set():
             with self.lock:
                 target_ids = list(self.broadcast_target_ids)
             if not target_ids:
@@ -1468,7 +1472,7 @@ class TeacherDeployServer:
                     dtype=AUDIO_DTYPE,
                     blocksize=AUDIO_BLOCK_SIZE,
                 ) as stream:
-                    while not self.broadcast_audio_stop_event.is_set():
+                    while not stop_event.is_set():
                         with self.lock:
                             target_ids = list(self.broadcast_target_ids)
                         if not target_ids:
@@ -1501,17 +1505,30 @@ class TeacherDeployServer:
                                 pass
             except Exception as exc:
                 self._log_event("broadcast_audio_error", reason=str(exc))
-                if self.broadcast_audio_stop_event.wait(1.0):
+                if stop_event.wait(1.0):
                     break
-        self.broadcast_audio_stop_event.set()
 
     def start_broadcast(self, targets: list[str]) -> list[str]:
+        sockets_to_close: list[socket.socket] = []
         with self.lock:
             eligible = [
                 pc_id for pc_id in targets
                 if pc_id in self.clients and self.clients[pc_id].online and self.clients[pc_id].control_sock is not None
             ]
+            for pc_id in eligible:
+                client = self.clients[pc_id]
+                if client.broadcast_sock is not None:
+                    sockets_to_close.append(client.broadcast_sock)
+                    client.broadcast_sock = None
+                if client.broadcast_audio_sock is not None:
+                    sockets_to_close.append(client.broadcast_audio_sock)
+                    client.broadcast_audio_sock = None
             self.broadcast_target_ids.update(eligible)
+        for client_sock in sockets_to_close:
+            try:
+                client_sock.close()
+            except OSError:
+                pass
         if not eligible:
             return []
         started: list[str] = []
@@ -1577,6 +1594,8 @@ class TeacherDeployServer:
                 return
             pc_id = str(reg.get("pc_id", ""))
             role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
+            ensure_broadcast_video = False
+            ensure_broadcast_audio = False
             with self.lock:
                 if pc_id not in self.clients:
                     return
@@ -1590,6 +1609,7 @@ class TeacherDeployServer:
                     client.broadcast_generation += 1
                     owned_video_generation = client.broadcast_generation
                     client.broadcast_sock = client_sock
+                    ensure_broadcast_video = True
                 elif role == "broadcast_audio_downlink":
                     if client.broadcast_audio_sock and client.broadcast_audio_sock is not client_sock:
                         try:
@@ -1599,6 +1619,7 @@ class TeacherDeployServer:
                     client.broadcast_audio_generation += 1
                     owned_video_generation = client.broadcast_audio_generation
                     client.broadcast_audio_sock = client_sock
+                    ensure_broadcast_audio = True
                 else:
                     if client.video_sock and client.video_sock is not client_sock:
                         try:
@@ -1608,6 +1629,10 @@ class TeacherDeployServer:
                     client.video_generation += 1
                     owned_video_generation = client.video_generation
                     client.video_sock = client_sock
+            if ensure_broadcast_video:
+                self._ensure_broadcast_loop()
+            if ensure_broadcast_audio:
+                self._ensure_broadcast_audio_loop()
             if role == "broadcast_downlink":
                 self._log_event("broadcast_video_registered", pc_id=pc_id)
                 while True:
