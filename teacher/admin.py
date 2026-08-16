@@ -207,6 +207,9 @@ class TeacherDeployServer:
         self.timers: dict[str, TimerState] = {}
         self.effective_states: dict[str, EffectiveState] = {}
         self.metrics: dict[str, ClientMetrics] = {}
+        for pc_id in self.registry.list_pc_ids():
+            self.sensors[pc_id] = SensorState()
+            self.metrics[pc_id] = ClientMetrics()
         self.error_events: deque[ErrorEvent] = deque(maxlen=256)
         self.health_history: deque[HealthSnapshot] = deque(maxlen=HEALTH_HISTORY_LIMIT)
         self.frame_queue: queue.Queue[tuple[str, Image.Image]] = queue.Queue(maxsize=RUNTIME.frame_queue_max)
@@ -1734,15 +1737,19 @@ class TeacherDeployServer:
                     if isinstance(fan_rpm, int) and (fan_rpm < 0 or fan_rpm > 20000):
                         self._record_error("SENSOR_OUTLIER", pc_id, f"fan_rpm outlier={fan_rpm}")
                         continue
+                    is_unknown_sensor = False
                     with self.lock:
                         if pc_id not in self.sensors:
-                            self._record_error("SENSOR_VALIDATION_ERROR", pc_id, "sensor payload for unknown pc_id")
-                            continue
-                        sensor = self.sensors[pc_id]
-                        sensor.temperature = float(temperature) if isinstance(temperature, (int, float)) else None
-                        sensor.fan_ok = fan_ok if isinstance(fan_ok, bool) else None
-                        sensor.fan_rpm = fan_rpm if isinstance(fan_rpm, int) else None
-                        sensor.last_update = time.time()
+                            is_unknown_sensor = True
+                        else:
+                            sensor = self.sensors[pc_id]
+                            sensor.temperature = float(temperature) if isinstance(temperature, (int, float)) else None
+                            sensor.fan_ok = fan_ok if isinstance(fan_ok, bool) else None
+                            sensor.fan_rpm = fan_rpm if isinstance(fan_rpm, int) else None
+                            sensor.last_update = time.time()
+                    if is_unknown_sensor:
+                        self._record_error("SENSOR_VALIDATION_ERROR", pc_id, "sensor payload for unknown pc_id")
+                        continue
                     self._put_bounded(self.sensor_queue, pc_id)
             except OSError as exc:
                 self._log_event("sensor_server_restart", reason=str(exc))

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    teacher_host: str = "192.168.43.41" ##110.236
+    teacher_host: str = "192.168.1.157" ##110.236
     control_port: int = 9201
     video_port: int = 9200
     sensor_port: int = 9202
