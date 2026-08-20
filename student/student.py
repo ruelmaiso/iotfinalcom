@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 
 from config.deploy_settings import NETWORK, RUNTIME
 from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.student_settings import StudentSettings, StudentSettingsStore, normalize_teacher_host
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -75,6 +76,8 @@ class OverlayController:
         self._worker_lock = threading.Lock()
         self._auth_result_q: "queue.Queue[Optional[dict]]" = queue.Queue()
         self._auth_handlers: Optional[tuple] = None
+        self._teacher_host_getter: Optional[Callable[[], str]] = None
+        self._teacher_host_saver: Optional[Callable[[str], tuple[bool, str]]] = None
 
       # NEW: deterministic UI bootstrap synchronization
         self._ui_ready_event = threading.Event()
@@ -149,7 +152,56 @@ class OverlayController:
             text="Retrying connection in the background.",
             font=("Arial", 13, "bold"),
             text_color="#60A5FA",
-        ).pack(pady=(0, 34))
+        ).pack(pady=(0, 14))
+
+        settings_box = ctk.CTkFrame(card, fg_color="#0F172A", corner_radius=14)
+        settings_box.pack(fill="x", padx=32, pady=(0, 34))
+        ctk.CTkLabel(
+            settings_box,
+            text="Teacher/Admin Server IP",
+            font=("Arial", 13, "bold"),
+            text_color="#E2E8F0",
+        ).pack(anchor="w", padx=16, pady=(14, 4))
+
+        current_host = ""
+        if self._teacher_host_getter is not None:
+            try:
+                current_host = self._teacher_host_getter()
+            except Exception:
+                current_host = ""
+        host_var = ctk.StringVar(value=current_host)
+        host_entry = ctk.CTkEntry(
+            settings_box,
+            textvariable=host_var,
+            placeholder_text="Example: 192.168.1.157",
+            height=34,
+        )
+        host_entry.pack(fill="x", padx=16, pady=(0, 8))
+        status_label = ctk.CTkLabel(
+            settings_box,
+            text="Change this if the teacher/admin computer uses a different IP.",
+            font=("Arial", 11),
+            text_color="#94A3B8",
+            wraplength=460,
+            justify="left",
+        )
+        status_label.pack(anchor="w", padx=16, pady=(0, 10))
+
+        def save_host() -> None:
+            if self._teacher_host_saver is None:
+                status_label.configure(text="Server IP settings are unavailable.", text_color="#EF4444")
+                return
+            ok, message = self._teacher_host_saver(host_var.get())
+            status_label.configure(text=message, text_color="#22C55E" if ok else "#EF4444")
+
+        ctk.CTkButton(
+            settings_box,
+            text="Save & Reconnect",
+            command=save_host,
+            height=32,
+            fg_color="#2563EB",
+            hover_color="#1D4ED8",
+        ).pack(anchor="e", padx=16, pady=(0, 14))
 
         return frame
 
@@ -464,6 +516,14 @@ class OverlayController:
 
     def set_chat_sender(self, sender: Callable[[str], bool]) -> None:
         self._chat_send_handler = sender
+
+    def set_teacher_host_settings(
+        self,
+        host_getter: Callable[[], str],
+        host_saver: Callable[[str], tuple[bool, str]],
+    ) -> None:
+        self._teacher_host_getter = host_getter
+        self._teacher_host_saver = host_saver
 
     def set_chat_timer_provider(self, provider: Callable[[], Optional[int]]) -> None:
         self._chat_timer_provider = provider
@@ -1201,14 +1261,16 @@ class TimerManager:
 
 
 class StudentDeployClient:
-    def __init__(self, teacher_ip: str) -> None:
-        self.teacher_ip = teacher_ip
+    def __init__(self, teacher_ip: str, settings_store: Optional[StudentSettingsStore] = None) -> None:
+        self.settings_store = settings_store or StudentSettingsStore(default_teacher_host=teacher_ip)
+        self.teacher_ip = normalize_teacher_host(teacher_ip)
         self.hostname = socket.gethostname()
         self.mac = self._get_mac()
         self.pc_id: Optional[str] = None
 
         self.overlay = OverlayController()
         self.overlay.set_chat_sender(self.send_session_message)
+        self.overlay.set_teacher_host_settings(self.get_teacher_ip, self.save_teacher_ip)
         self.overlay.set_chat_timer_provider(self._chat_remaining_s)
         self.timer_manager = TimerManager(
             self._on_timer_lock,
@@ -1252,6 +1314,32 @@ class StudentDeployClient:
         self.broadcast_active = False
         self._broadcast_audio_missing_warned = False
         self._broadcast_audio_device_warned = False
+
+
+    def get_teacher_ip(self) -> str:
+        return self.teacher_ip
+
+    def save_teacher_ip(self, new_host: str) -> tuple[bool, str]:
+        try:
+            normalized = normalize_teacher_host(new_host)
+            changed = self.update_teacher_ip(normalized)
+            self.settings_store.save(StudentSettings(teacher_host=normalized))
+            if changed:
+                return True, f"Saved. Reconnecting to {normalized}..."
+            return True, f"Saved. Already using {normalized}."
+        except ValueError as exc:
+            return False, str(exc)
+        except Exception as exc:
+            return False, f"Could not save server IP: {exc}"
+
+    def update_teacher_ip(self, new_host: str) -> bool:
+        normalized = normalize_teacher_host(new_host)
+        if normalized == self.teacher_ip:
+            return False
+        self.teacher_ip = normalized
+        self._update_state(connected=False, connecting=False)
+        self._cleanup_sockets()
+        return True
 
     def _state_snapshot(self) -> dict:
         with self.state_lock:
@@ -2158,7 +2246,9 @@ class StudentDeployClient:
 
 
 def main() -> None:
-    client = StudentDeployClient(NETWORK.teacher_host)
+    settings_store = StudentSettingsStore(default_teacher_host=NETWORK.teacher_connect_host)
+    settings = settings_store.load()
+    client = StudentDeployClient(settings.teacher_host, settings_store=settings_store)
     try:
         client.run()
     except KeyboardInterrupt:

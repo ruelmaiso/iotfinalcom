@@ -11,6 +11,8 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 @dataclass
 class AppSettings:
+    teacher_bind_host: str = "0.0.0.0"
+    teacher_connect_host: str = "192.168.1.157"
     main_stream_profile: str = "720p"
     preview_stream_profile: str = "360p"
     recording_mode: str = "off"  # off|manual|auto
